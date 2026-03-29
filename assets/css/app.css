@@ -6,6 +6,30 @@
 @source "../js";
 @source "../../lib/flux_claw_web";
 
+@import "../node_modules/easymde/dist/easymde.min.css";
+
+/* EasyMDE in dark theme (html data-theme) */
+[data-theme="dark"] .EasyMDEContainer .CodeMirror {
+  background-color: oklch(22% 0.01 260);
+  color: oklch(92% 0.01 260);
+  border-color: oklch(35% 0.02 260);
+}
+[data-theme="dark"] .EasyMDEContainer .CodeMirror-cursor {
+  border-left-color: oklch(85% 0.02 260);
+}
+[data-theme="dark"] .editor-toolbar {
+  background: oklch(24% 0.01 260);
+  border-color: oklch(35% 0.02 260);
+}
+[data-theme="dark"] .editor-toolbar button {
+  color: oklch(80% 0.02 260);
+}
+[data-theme="dark"] .editor-preview,
+[data-theme="dark"] .editor-preview-side {
+  background: oklch(22% 0.01 260);
+  color: oklch(90% 0.01 260);
+}
+
 /* A Tailwind plugin that makes "hero-#{ICON}" classes available.
    The heroicons installation itself is managed by your mix.exs */
 @plugin "../vendor/heroicons";

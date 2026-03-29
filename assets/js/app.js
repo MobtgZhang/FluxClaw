@@ -24,11 +24,127 @@ import {Socket} from "phoenix"
 import {LiveSocket} from "phoenix_live_view"
 import {hooks as colocatedHooks} from "phoenix-colocated/flux_claw"
 import topbar from "../vendor/topbar"
+import EasyMDE from "easymde"
 
 const Hooks = {
+  SidebarContextMenu: {
+    mounted() {
+      this.el.addEventListener("click", e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const r = this.el.getBoundingClientRect()
+        this.pushEvent("open_context_menu", {
+          type: this.el.getAttribute("data-menu-type"),
+          id: this.el.getAttribute("data-menu-id"),
+          top: Math.round(r.top),
+          left: Math.round(r.left),
+          right: Math.round(r.right),
+          bottom: Math.round(r.bottom)
+        })
+      })
+    }
+  },
+  MarkdownEditor: {
+    mounted() {
+      const ta = this.el.querySelector("textarea")
+      if (!ta) return
+      this.form = this.el.closest("form")
+      this.mde = new EasyMDE({
+        element: ta,
+        spellChecker: false,
+        status: false,
+        minHeight: "280px",
+        toolbar: [
+          "bold",
+          "italic",
+          "heading",
+          "|",
+          "quote",
+          "unordered-list",
+          "ordered-list",
+          "|",
+          "link",
+          "image",
+          "|",
+          "preview",
+          "side-by-side",
+          "fullscreen",
+          "|",
+          "guide"
+        ]
+      })
+      this.handleEvent("mde_set_value", ({body}) => {
+        if (!this.mde) return
+        const s = body == null ? "" : String(body)
+        this.mde.value(s)
+        this.mde.codemirror.refresh()
+      })
+      this._onSubmit = () => {
+        try {
+          this.mde?.codemirror?.save()
+        } catch (_) {}
+      }
+      this.form?.addEventListener("submit", this._onSubmit)
+    },
+    destroyed() {
+      this.form?.removeEventListener("submit", this._onSubmit)
+      if (this.mde) {
+        this.mde.toTextArea()
+        this.mde = null
+      }
+    }
+  },
+  ThemeToggle: {
+    mounted() {
+      this.moon = this.el.querySelector('[data-theme-icon="moon"]')
+      this.sun = this.el.querySelector('[data-theme-icon="sun"]')
+      const sync = () => {
+        const dark = document.documentElement.getAttribute("data-theme") === "dark"
+        // 深色主题显示月亮，浅色主题显示太阳（表示当前模式）
+        this.moon?.classList.toggle("hidden", !dark)
+        this.sun?.classList.toggle("hidden", dark)
+      }
+      sync()
+      this.el.addEventListener("click", () => {
+        const html = document.documentElement
+        const next = html.getAttribute("data-theme") === "dark" ? "light" : "dark"
+        html.setAttribute("data-theme", next)
+        localStorage.setItem("phx:theme", next)
+        sync()
+      })
+    }
+  },
   ChatScroll: {
     mounted() {
       this.scrollBottom()
+      const evName = this.el.getAttribute("data-external-link-event") || "external_link_click"
+      this._externalLinkHandler = e => {
+        const a = e.target.closest?.("a[href]")
+        if (!a || !a.href) return
+        try {
+          const u = new URL(a.href, window.location.origin)
+          if (u.protocol === "http:" || u.protocol === "https:") {
+            if (u.host === window.location.host) return
+            e.preventDefault()
+            e.stopPropagation()
+            this.pushEvent(evName, {
+              url: a.href,
+              title: (a.textContent || "").trim().slice(0, 300)
+            })
+          }
+        } catch (_) {}
+      }
+      this.el.addEventListener("click", this._externalLinkHandler)
+      this.handleEvent("open_external", ({url}) => {
+        if (url && typeof url === "string") {
+          window.open(url, "_blank", "noopener,noreferrer")
+        }
+      })
+    },
+    destroyed() {
+      if (this._externalLinkHandler) {
+        this.el.removeEventListener("click", this._externalLinkHandler)
+      }
     },
     updated() {
       this.scrollBottom()
@@ -51,10 +167,9 @@ const Hooks = {
       this.el.style.height = Math.min(this.el.scrollHeight, 220) + "px"
     },
     onKeydown(e) {
-      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-        e.preventDefault()
-        this.el.closest("form")?.requestSubmit()
-      }
+      if (e.key !== "Enter" || e.shiftKey || e.isComposing) return
+      e.preventDefault()
+      this.el.closest("form")?.requestSubmit()
     }
   }
 }
