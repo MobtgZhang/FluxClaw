@@ -23,12 +23,73 @@ end
 if config_env() != :test do
   file_cfg = FluxClaw.ConfigLoader.load()
 
+  default_cache = FluxClaw.ConfigLoader.default_cache_root()
+
+  cache_root =
+    System.get_env("FLUXCLAW_CACHE_ROOT") ||
+      Map.get(file_cfg, :cache_root) ||
+      default_cache
+
+  cache_root = Path.expand(cache_root)
+
   sandbox_root =
     System.get_env("FLUX_CLAW_SANDBOX") ||
       Map.get(file_cfg, :flux_claw_sandbox) ||
       Path.expand("../tmp/flux_claw_sandbox", __DIR__)
 
+  max_steps =
+    case System.get_env("FLUXCLAW_MAX_STEPS") do
+      nil ->
+        Map.get(file_cfg, :agents_max_steps)
+
+      "" ->
+        nil
+
+      s ->
+        case Integer.parse(String.trim(s)) do
+          {i, _} -> i
+          _ -> nil
+        end
+    end
+
+  if max_steps != nil do
+    config :flux_claw, :agents, max_steps: max_steps
+  end
+
+  if Map.has_key?(file_cfg, :agents_self_evolve) do
+    config :flux_claw, :agents, self_evolve: Map.fetch!(file_cfg, :agents_self_evolve)
+  end
+
+  if Map.has_key?(file_cfg, :agents_crystallize_skills) do
+    config :flux_claw, :agents,
+      crystallize_skills: Map.fetch!(file_cfg, :agents_crystallize_skills)
+  end
+
+  if Map.has_key?(file_cfg, :agents_crystallize_mode) do
+    config :flux_claw, :agents, crystallize_mode: Map.fetch!(file_cfg, :agents_crystallize_mode)
+  end
+
   config :flux_claw, :agents, sandbox_root: sandbox_root
+
+  history_root =
+    System.get_env("FLUXCLAW_CACHE_HISTORY") ||
+      Map.get(file_cfg, :cache_history_root) ||
+      Path.join(cache_root, "history")
+
+  internal_skills =
+    System.get_env("FLUXCLAW_CACHE_INTERNAL_SKILLS") ||
+      Map.get(file_cfg, :cache_internal_skills) ||
+      Path.join(cache_root, "skills")
+
+  memory_root =
+    System.get_env("FLUXCLAW_CACHE_MEMORY") ||
+      Map.get(file_cfg, :cache_memory_root) ||
+      Path.join(cache_root, "memory")
+
+  external_skills =
+    System.get_env("FLUXCLAW_CACHE_EXTERNAL_SKILLS") ||
+      Map.get(file_cfg, :cache_external_skills) ||
+      ""
 
   config :flux_claw, :llm,
     api_key: System.get_env("OPENAI_API_KEY") || Map.get(file_cfg, :openai_api_key),
@@ -40,7 +101,17 @@ if config_env() != :test do
       System.get_env("OPENAI_MODEL") ||
         Map.get(file_cfg, :openai_model) ||
         "gpt-4o-mini",
+    temperature: Map.get(file_cfg, :openai_temperature),
+    top_p: Map.get(file_cfg, :openai_top_p),
+    top_k: Map.get(file_cfg, :openai_top_k),
     llm_module: FluxClaw.LLM.OpenAI
+
+  config :flux_claw, :cache_paths,
+    cache_root: cache_root,
+    external_skills: external_skills,
+    internal_skills: internal_skills,
+    history_root: history_root,
+    memory_root: memory_root
 end
 
 config :flux_claw, FluxClawWeb.Endpoint,

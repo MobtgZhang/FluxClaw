@@ -46,4 +46,5 @@ config :flux_claw, :llm,
 
 config :flux_claw, :agents,
   crystallize_skills: false,
+  self_evolve: false,
   sandbox_root: Path.expand("../tmp/test_flux_claw_sandbox", __DIR__)

@@ -15,13 +15,24 @@ config :flux_claw, FluxClaw.Repo, adapter: Ecto.Adapters.SQLite3
 
 config :flux_claw, :agents,
   max_steps: 32,
-  crystallize_skills: true
+  crystallize_skills: true,
+  crystallize_mode: :auto,
+  self_evolve: true
+
+config :flux_claw, :cache_paths,
+  cache_root: nil,
+  external_skills: nil,
+  internal_skills: nil,
+  history_root: nil,
+  memory_root: nil
 
 config :flux_claw, :memory_l0,
   rules: [
     "You are FluxClaw, a careful assistant with access to tools. Prefer safe, minimal changes.",
     "Stay within the sandbox directory for all file operations.",
-    "If uncertain, use ask_user to confirm with the human."
+    "If uncertain, use ask_user to confirm with the human.",
+    "Self-evolve: after tool-heavy turns, distill durable lessons into concise checklists; prefer updating skills over repeating mistakes.",
+    "When self-evolution is enabled, your tool-using episodes are logged under memory for later reuse; generalize patterns, avoid one-off noise."
   ]
 
 # Configure the endpoint
@@ -51,7 +62,17 @@ config :esbuild,
     args:
       ~w(js/app.js --bundle --target=es2022 --outdir=../priv/static/assets/js --external:/fonts/* --external:/images/* --alias:@=.),
     cd: Path.expand("../assets", __DIR__),
-    env: %{"NODE_PATH" => [Path.expand("../deps", __DIR__), Mix.Project.build_path()]}
+    env: %{
+      "NODE_PATH" =>
+        Enum.join(
+          [
+            Path.expand("../deps", __DIR__),
+            Mix.Project.build_path(),
+            Path.expand("../assets/node_modules", __DIR__)
+          ],
+          ":"
+        )
+    }
   ]
 
 # Configure tailwind (the version is required)
