@@ -27,11 +27,22 @@ defmodule FluxClawWeb.Layouts do
   """
   attr :flash, :map, required: true, doc: "the map of flash messages"
 
-  attr :current_scope, :map,
+  attr :current_scope, :any,
     default: nil,
     doc: "the current [scope](https://hexdocs.pm/phoenix/scopes.html)"
 
+  attr :variant, :atom,
+    default: :default,
+    doc: ":default full chrome, :bare flash + content only (e.g. chat)"
+
   slot :inner_block, required: true
+
+  def app(%{variant: :bare} = assigns) do
+    ~H"""
+    <.flash_group flash={@flash} />
+    {render_slot(@inner_block)}
+    """
+  end
 
   def app(assigns) do
     ~H"""

@@ -4,14 +4,56 @@ defmodule FluxClaw.Memory do
   alias FluxClaw.Repo
   alias FluxClaw.Memory.{Skill, Checkpoint}
 
-  def list_skills_for_prompt(query_text \\ "") when is_binary(query_text) do
+  @global_skill_hint ~r/(全部技能|其他项目|别的项目|跨项目|all\s+skills|other\s+projects?)/iu
+
+  def list_skills_for_prompt(query_text \\ "", project_id \\ nil)
+
+  def list_skills_for_prompt(query_text, nil) do
+    q = String.trim(query_text || "")
+    list_skills_db(q, nil, 10) ++ external_skills_matching(q, 4)
+  end
+
+  def list_skills_for_prompt(query_text, project_id) when is_binary(project_id) do
+    q = String.trim(query_text || "")
+    limit = if q == "", do: 10, else: 8
+    db = list_skills_db(q, project_id, limit)
+    ext = external_skills_matching(q, 4)
+
+    merged =
+      if q != "" and Regex.match?(@global_skill_hint, q) do
+        global = list_skills_db(q, nil, 6)
+        dedupe_skills(db ++ global)
+      else
+        db
+      end
+
+    merged ++ ext
+  end
+
+  defp dedupe_skills(skills) do
+    skills
+    |> Enum.uniq_by(fn
+      %Skill{id: id} -> id
+      %{id: id} -> id
+      m -> Map.get(m, :title) || Map.get(m, "title") || :unknown
+    end)
+  end
+
+  defp list_skills_db(query_text, project_id, limit) do
     q = String.trim(query_text)
 
     base =
       from(s in Skill,
         order_by: [desc: s.inserted_at],
-        limit: 8
+        limit: ^limit
       )
+
+    base =
+      if project_id do
+        from(s in base, where: s.project_id == ^project_id)
+      else
+        base
+      end
 
     base =
       if q != "" do
@@ -30,6 +72,53 @@ defmodule FluxClaw.Memory do
     Repo.all(base)
   end
 
+  defp external_skills_matching(query_text, limit) do
+    q = String.trim(query_text) |> String.downcase()
+
+    external_skill_paths()
+    |> Enum.map(&load_external_md/1)
+    |> Enum.filter(fn %{title: t, body: b} ->
+      if q == "" do
+        true
+      else
+        String.contains?(String.downcase(t <> " " <> b), q)
+      end
+    end)
+    |> Enum.take(limit)
+  end
+
+  defp external_skill_paths do
+    case cache_path(:external_skills) do
+      root when is_binary(root) and root != "" ->
+        if File.dir?(root) do
+          root
+          |> Path.join("**/*.{md,mdx,txt}")
+          |> Path.wildcard()
+        else
+          []
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  defp load_external_md(path) do
+    case File.read(path) do
+      {:ok, body} ->
+        title = path |> Path.basename() |> Path.rootname()
+        %{title: title <> " (external)", body: body, source: "external_file"}
+
+      _ ->
+        %{title: Path.basename(path), body: "", source: "external_file"}
+    end
+  end
+
+  def cache_path(key) do
+    paths = Application.get_env(:flux_claw, :cache_paths, []) || []
+    Keyword.get(paths, key)
+  end
+
   def create_skill(attrs) do
     %Skill{}
     |> Skill.changeset(attrs)
@@ -39,7 +128,9 @@ defmodule FluxClaw.Memory do
   def skills_to_prompt_block(skills) when is_list(skills) do
     skills
     |> Enum.map_join("\n\n---\n\n", fn s ->
-      "### #{s.title}\n#{s.body}"
+      title = Map.get(s, :title) || Map.get(s, "title")
+      body = Map.get(s, :body) || Map.get(s, "body")
+      "### #{title}\n#{body}"
     end)
   end
 
@@ -63,10 +154,179 @@ defmodule FluxClaw.Memory do
     |> Repo.all()
   end
 
+  def list_skills_for_project(project_id, limit \\ 32) when is_binary(project_id) do
+    from(s in Skill,
+      where: s.project_id == ^project_id,
+      order_by: [desc: s.inserted_at],
+      limit: ^limit
+    )
+    |> Repo.all()
+  end
+
+  def move_skill_to_project(skill_id, project_id)
+      when is_binary(skill_id) and is_binary(project_id) do
+    case Repo.get(Skill, skill_id) do
+      nil -> {:error, :not_found}
+      skill -> skill |> Skill.changeset(%{project_id: project_id}) |> Repo.update()
+    end
+  end
+
   def delete_skill(id) do
     case Repo.get(Skill, id) do
       nil -> {:error, :not_found}
       skill -> Repo.delete(skill)
+    end
+  end
+
+  def get_skill(id), do: Repo.get(Skill, id)
+
+  def update_skill(%Skill{} = skill, attrs) do
+    skill
+    |> Skill.changeset(attrs)
+    |> Repo.update()
+  end
+
+  @doc "Markdown / text files under internal_skills and external_skills roots (for import UI)."
+  def list_skill_import_files do
+    roots =
+      [cache_path(:internal_skills), cache_path(:external_skills)]
+      |> Enum.filter(&(is_binary(&1) and &1 != "" and File.dir?(&1)))
+      |> Enum.map(&Path.expand/1)
+      |> Enum.uniq()
+
+    roots
+    |> Enum.flat_map(fn root ->
+      root
+      |> Path.join("**/*.{md,mdx,txt}")
+      |> Path.wildcard()
+    end)
+    |> Enum.uniq()
+    |> Enum.map(fn p ->
+      exp = Path.expand(p)
+      %{path: exp, name: Path.basename(exp)}
+    end)
+  end
+
+  @doc "Markdown files under memory_root (read-only listing for sidebar)."
+  def list_memory_markdown_docs do
+    case cache_path(:memory_root) do
+      root when is_binary(root) and root != "" ->
+        r = Path.expand(root)
+
+        if File.dir?(r) do
+          r
+          |> Path.join("**/*.{md,mdx,txt}")
+          |> Path.wildcard()
+          |> Enum.map(fn p ->
+            exp = Path.expand(p)
+            %{path: exp, name: Path.basename(exp)}
+          end)
+        else
+          []
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  def path_allowed_for_skill_import?(path) when is_binary(path) do
+    exp = Path.expand(path)
+
+    allowed =
+      [cache_path(:internal_skills), cache_path(:external_skills)]
+      |> Enum.filter(&(is_binary(&1) and &1 != ""))
+      |> Enum.map(&Path.expand/1)
+
+    Enum.any?(allowed, fn root -> String.starts_with?(exp, root) end)
+  end
+
+  def import_skill_from_file(path, project_id) when is_binary(path) and is_binary(project_id) do
+    if not path_allowed_for_skill_import?(path) do
+      {:error, :forbidden}
+    else
+      case File.read(path) do
+        {:ok, body} ->
+          title = path |> Path.basename() |> Path.rootname()
+
+          create_skill(%{
+            title: title,
+            body: body,
+            keywords: "",
+            project_id: project_id,
+            source: "file_import"
+          })
+
+        {:error, _} ->
+          {:error, :read_failed}
+      end
+    end
+  end
+
+  def append_evolution_log_line(session_id, line) when is_binary(line) do
+    if Application.get_env(:flux_claw, :agents, [])[:self_evolve] == false do
+      :ok
+    else
+      case cache_path(:memory_root) do
+        root when is_binary(root) and root != "" ->
+          File.mkdir_p!(Path.expand(root))
+          path = Path.join(Path.expand(root), "evolution_log.md")
+
+          stamp =
+            DateTime.utc_now() |> Calendar.strftime("%Y-%m-%d %H:%M")
+
+          short = String.slice(session_id, 0, 8)
+          block = "\n* #{stamp} — #{short} — #{line}\n"
+          File.write!(path, block, [:append])
+
+        _ ->
+          :ok
+      end
+    end
+  end
+
+  @doc """
+  自进化：将带工具调用的回合摘要追加到 `memory_root/evolution_episodes.md`，
+  便于后续检索与技能结晶（经验回放式记录，不额外调用 LLM）。
+  """
+  def append_evolution_episode(session_id, user_text, tool_names, assistant_preview)
+      when is_binary(session_id) do
+    if Application.get_env(:flux_claw, :agents, [])[:self_evolve] == false do
+      :ok
+    else
+      case cache_path(:memory_root) do
+        root when is_binary(root) and root != "" ->
+          File.mkdir_p!(Path.expand(root))
+          path = Path.join(Path.expand(root), "evolution_episodes.md")
+
+          stamp =
+            DateTime.utc_now() |> Calendar.strftime("%Y-%m-%d %H:%M UTC")
+
+          ut =
+            (user_text || "")
+            |> String.replace("\n", " ")
+            |> String.slice(0, 240)
+
+          ap =
+            (assistant_preview || "")
+            |> String.replace("\n", " ")
+            |> String.slice(0, 400)
+
+          short = String.slice(session_id, 0, 8)
+
+          block = """
+
+          ### #{stamp} · #{short}
+          - **用户**: #{ut}
+          - **工具**: #{tool_names}
+          - **助手摘要**: #{ap}
+          """
+
+          File.write!(path, block, [:append])
+
+        _ ->
+          :ok
+      end
     end
   end
 end

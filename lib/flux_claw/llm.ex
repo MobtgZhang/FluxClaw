@@ -8,14 +8,19 @@ defmodule FluxClaw.LLM do
   @callback complete(messages :: [message()], tools :: [tool_spec()], opts :: keyword()) ::
               {:ok, map()} | {:error, term()}
 
-  @doc "Streams SSE chunks; events: {:content_delta, binary}, {:tool_calls, list}, :done, {:error, term}"
+  @doc """
+  Streams SSE chunks. Callback may receive:
+  `{:reasoning_delta, binary}`, `{:content_delta, binary}`, `:done`, `{:error, term}`.
+
+  Returns `{:ok, final_choice_map}` (same shape as `complete/3`) or `{:error, term}`.
+  """
   @callback stream(
               messages :: [message()],
               tools :: [tool_spec()],
               opts :: keyword(),
               callback :: (term() -> any)
             ) ::
-              :ok | {:error, term()}
+              {:ok, map()} | {:error, term()}
 
   def impl do
     Application.get_env(:flux_claw, :llm, [])[:llm_module] || FluxClaw.LLM.OpenAI

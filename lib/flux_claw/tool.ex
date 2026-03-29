@@ -21,6 +21,9 @@ defmodule FluxClaw.Tool do
     FluxClaw.Tools.FileRead,
     FluxClaw.Tools.FileWrite,
     FluxClaw.Tools.FilePatch,
+    FluxClaw.Tools.ShellExecute,
+    FluxClaw.Tools.WebFetch,
+    FluxClaw.Tools.TaskPlan,
     FluxClaw.Tools.AskUser,
     FluxClaw.Tools.UpdateCheckpoint,
     FluxClaw.Tools.LongTermFact

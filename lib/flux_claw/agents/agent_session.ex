@@ -6,13 +6,14 @@ defmodule FluxClaw.Agents.AgentSession do
   @foreign_key_type :binary_id
   schema "agent_sessions" do
     field :title, :string
+    belongs_to :project, FluxClaw.Projects.Project
     has_many :messages, FluxClaw.Agents.AgentMessage, foreign_key: :session_id
     timestamps(type: :utc_datetime)
   end
 
   def changeset(session, attrs) do
     session
-    |> cast(attrs, [:title])
+    |> cast(attrs, [:title, :project_id])
     |> validate_required([:title])
   end
 end

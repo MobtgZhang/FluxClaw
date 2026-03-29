@@ -8,13 +8,15 @@ defmodule FluxClaw.Memory.Skill do
     field :title, :string
     field :body, :string
     field :keywords, :string
+    field :source, :string
     belongs_to :session, FluxClaw.Agents.AgentSession
+    belongs_to :project, FluxClaw.Projects.Project
     timestamps(type: :utc_datetime)
   end
 
   def changeset(skill, attrs) do
     skill
-    |> cast(attrs, [:title, :body, :keywords, :session_id])
+    |> cast(attrs, [:title, :body, :keywords, :session_id, :project_id, :source])
     |> validate_required([:title, :body])
   end
 end

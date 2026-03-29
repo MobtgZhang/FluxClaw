@@ -13,10 +13,22 @@ defmodule FluxClaw.LLM.Mock do
           tool_response(name, args, text)
 
         text when is_binary(text) ->
-          %{role: "assistant", content: text, tool_calls: [], finish_reason: "stop"}
+          %{
+            role: "assistant",
+            content: text,
+            reasoning: nil,
+            tool_calls: [],
+            finish_reason: "stop"
+          }
 
         _ ->
-          %{role: "assistant", content: "mock ok", tool_calls: [], finish_reason: "stop"}
+          %{
+            role: "assistant",
+            content: "mock ok",
+            reasoning: nil,
+            tool_calls: [],
+            finish_reason: "stop"
+          }
       end
 
     {:ok, reply}
@@ -25,10 +37,30 @@ defmodule FluxClaw.LLM.Mock do
   @impl true
   def stream(messages, _tools, _opts, callback) do
     {:ok, m} = complete(messages, [], [])
-    if m.content && m.content != "", do: callback.({:content_delta, m.content})
-    callback.({:tool_calls, m.tool_calls || []})
+
+    if m[:reasoning] && m.reasoning != "" do
+      for chunk <- chunk_utf8(m.reasoning, 3) do
+        callback.({:reasoning_delta, chunk})
+      end
+    end
+
+    content = m.content || ""
+
+    if content != "" do
+      for chunk <- chunk_utf8(content, 2) do
+        callback.({:content_delta, chunk})
+      end
+    end
+
     callback.(:done)
-    :ok
+    {:ok, m}
+  end
+
+  defp chunk_utf8(str, size) do
+    str
+    |> String.graphemes()
+    |> Enum.chunk_every(size)
+    |> Enum.map(&IO.iodata_to_binary/1)
   end
 
   defp tool_response(name, args, _after_text) do
@@ -43,6 +75,7 @@ defmodule FluxClaw.LLM.Mock do
     %{
       role: "assistant",
       content: nil,
+      reasoning: nil,
       tool_calls: [call],
       finish_reason: "tool_calls"
     }

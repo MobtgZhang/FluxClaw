@@ -17,13 +17,13 @@ defmodule FluxClawWeb.Router do
   scope "/", FluxClawWeb do
     pipe_through :browser
 
-    get "/", PageController, :home
-
     get "/agents", RedirectController, :to_chat
     get "/agents/:id", RedirectController, :agents_to_chat
 
+    live "/", ChatLive, :chat
     live "/chat", ChatLive, :chat
     live "/chat/:id", ChatLive, :chat
+    live "/p/:project_id", ChatLive, :chat
   end
 
   # Other scopes may use custom stacks.
