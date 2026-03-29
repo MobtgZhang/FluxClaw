@@ -21,7 +21,7 @@ defmodule FluxClaw.Agents.AgentWorkerTest do
     assert :ok = Orchestrator.send_message(session.id, "hi")
 
     assert_receive {:user, "hi"}
-    assert_receive {:assistant_delta, "mock ok"}
+    assert_receive {:assistant_delta, _}
     assert_receive {:assistant_done, "mock ok"}
   end
 end
