@@ -1,6 +1,6 @@
 # FluxClaw
 
-基于 **BEAM（Erlang/OTP 虚拟机）** 的多 Agent 对话应用：**Phoenix LiveView** 提供类 **ChatGPT** 的单页界面；每个会话对应独立的 `AgentWorker`（GenServer）+ `DynamicSupervisor`，流式事件经 **PubSub** 推到浏览器（对齐仓库内 [`idea/idea1.md`](idea/idea1.md)、[`idea/idea2.md`](idea/idea2.md) 的设计描述）。
+基于 **BEAM（Erlang/OTP 虚拟机）** 的多 Agent 对话应用：**Phoenix LiveView** 提供类 **ChatGPT** 的单页界面；每个会话对应独立的 `AgentWorker`（GenServer）+ `DynamicSupervisor`，流式事件经 **PubSub** 推到浏览器。
 
 与 [CuteClaw](https://github.com/MobtgZhang/CuteClaw)（Zig 核心、JSON 快照、技能进化门禁）相比：FluxClaw 将 **记忆 / 检查点 / 技能** 落在 **SQLite + Ecto**，在 LiveView 中提供 **侧栏会话、主对话流、检查点条、技能库（可删）** 等更易用的控制台；**不包含** CuteClaw 的 Zig CLI 与 `store.json` 格式兼容层（后续可做导入/导出）。
 
