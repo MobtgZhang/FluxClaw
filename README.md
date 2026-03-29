@@ -1,41 +1,32 @@
 # FluxClaw
 
-基于 **BEAM（Erlang/OTP 虚拟机）** 的多 Agent 对话应用：**Phoenix LiveView** 提供类 **ChatGPT** 的单页界面；每个会话对应独立的 `AgentWorker`（GenServer）+ `DynamicSupervisor`，流式事件经 **PubSub** 推到浏览器。
+基于 **BEAM（Erlang/OTP）** 与 **Phoenix LiveView** 的多工具对话应用：根路径即 **类 ChatGPT 聊天界面**；会话由 `AgentWorker`（GenServer）驱动，**SSE 流式**输出区分 **思考（reasoning）**、**正文** 与 **工具时间线**；**项目** 维度管理 **对话历史** 与 **技能（L3）**。
 
-与 [CuteClaw](https://github.com/MobtgZhang/CuteClaw)（Zig 核心、JSON 快照、技能进化门禁）相比：FluxClaw 将 **记忆 / 检查点 / 技能** 落在 **SQLite + Ecto**，在 LiveView 中提供 **侧栏会话、主对话流、检查点条、技能库（可删）** 等更易用的控制台；**不包含** CuteClaw 的 Zig CLI 与 `store.json` 格式兼容层（后续可做导入/导出）。
+架构与记忆分层说明见 **[docs/architecture.md](docs/architecture.md)**、**[docs/agent-and-memory.md](docs/agent-and-memory.md)**、**[docs/tools-and-safety.md](docs/tools-and-safety.md)**。
 
 ## 功能概要
 
-- OTP：`Registry` + `DynamicSupervisor` 按会话拉起 Agent；工具调用沙箱目录按会话隔离。
-- LLM：OpenAI 兼容 Chat Completions（优先读项目下 `.fluxclaw/config.json`，环境变量可覆盖）；测试环境使用 Mock。
-- 工具：`file_read` / `file_write` / `file_patch` / `ask_user` / `update_working_checkpoint` / `start_long_term_update`（见 `lib/flux_claw/tool.ex`）。
-- 前端：`/chat` 与 `/chat/:id` 为 ChatGPT 式布局；旧路径 `/agents` 会 **302** 到 `/chat`。
-- 观测：Telemetry 指标（如 `flux_claw.agent.steps`）；开发环境可访问 `/dev/dashboard`。
+- **路由**：`/`、`/chat`、`/chat/:session_id`、`/p/:project_id`；旧 `/agents` 重定向到 `/`。
+- **OTP**：Registry + DynamicSupervisor 按会话拉起 Agent；工具沙箱按会话目录隔离。
+- **LLM**：OpenAI 兼容 Chat Completions，**真实 SSE**（`stream: true`）；测试使用 Mock。
+- **工具**：`file_read` / `file_write` / `file_patch` / `shell_execute` / `web_fetch` / `task_plan` / `ask_user` / `update_working_checkpoint` / `start_long_term_update`（见 `lib/flux_claw/tool.ex`）。
+- **数据**：SQLite + Ecto — `projects`、`agent_sessions`（含 `project_id`）、`skills`（含 `project_id`、`source`）等。
+- **CI**：`.github/workflows/ci.yml`（参考 `idea/` 中「会话 + 流式」产品方向，落地为 compile / format / test）。
 
 ## 依赖环境
 
-- **Elixir** 1.15+、**Erlang/OTP**（与 Elixir 发行版匹配）。
-- **SQLite**（开发库为 `priv/repo/flux_claw_dev.db`，见 `config/dev.exs`）。
-- 调用真实模型时在 **`.fluxclaw/config.json`** 中填写 API Key（或设置 `OPENAI_API_KEY` 等环境变量覆盖）。
+- **Elixir** 1.15+、**Erlang/OTP**（与发行版匹配）。
+- **SQLite**（开发库见 `config/dev.exs`）。
 
-## 运行应用（开发）
-
-在项目根目录执行：
+## 快速开始
 
 ```bash
 cd /path/to/FluxClaw
-mix deps.get
-mix setup
+make setup
+# 或: mix deps.get && mix setup
 ```
 
-若数据库尚未创建或迁移未执行：
-
-```bash
-mix ecto.create
-mix ecto.migrate
-```
-
-在项目根目录创建 **`.fluxclaw/config.json`**（可复制 **`.fluxclaw/config.example.json`** 为 `config.json` 再改密钥；示例可提交仓库，`config.json` 已在 `.gitignore` 中忽略）：
+创建 **`.fluxclaw/config.json`**（可从 **[.fluxclaw/config.example.json](.fluxclaw/config.example.json)** 复制）：
 
 ```json
 {
@@ -44,56 +35,51 @@ mix ecto.migrate
     "base_url": "https://api.openai.com/v1",
     "model": "gpt-4o-mini"
   },
-  "sandbox_root": "./flux_claw_sandbox"
+  "sandbox_root": "./flux_claw_sandbox",
+  "cache_paths": {
+    "external_skills": "",
+    "internal_skills": "",
+    "history_root": ""
+  }
 }
 ```
 
-也支持顶层平铺键名：`openai_api_key`、`openai_base_url`、`openai_model`、`flux_claw_sandbox`（或 `sandbox_root`）。
-
-**环境变量优先于 JSON**：`OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`、`FLUX_CLAW_SANDBOX` 任一设置后会覆盖文件中的对应项。自定义配置文件路径可设置 **`FLUX_CLAW_CONFIG_PATH`**。
-
-然后启动：
+环境变量可覆盖文件配置：`OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`、`FLUX_CLAW_SANDBOX`、`FLUXCLAW_MAX_STEPS`（或 JSON 中 `agents.max_steps`，**`-1` 表示不限制轮次**）、`FLUXCLAW_CACHE_EXTERNAL_SKILLS`、`FLUXCLAW_CACHE_INTERNAL_SKILLS`、`FLUXCLAW_CACHE_HISTORY`、`FLUX_CLAW_CONFIG_PATH`。
 
 ```bash
-mix phx.server
+make serve
+# 或: mix phx.server
 ```
 
-浏览器打开：**http://localhost:4000/chat**（或首页链接进入）。
+浏览器打开：**http://localhost:4000/**
 
-使用 **IEx**：
+## Makefile 常用命令
+
+| 目标 | 说明 |
+|------|------|
+| `make setup` | `mix setup`（依赖、数据库、前端资源） |
+| `make test` | `mix test` |
+| `make serve` | `mix phx.server` |
+| `make precommit` | `mix precommit`（与 AGENTS.md 一致） |
+| `make clean-sandbox` | 删除本地沙箱目录（`flux_claw_sandbox`、`tmp/...`） |
+| `make clean-assets` | 删除 `priv/static/assets` 构建产物 |
+| `make clean-artifacts` | 删除 `_build`、`deps`、沙箱与 assets（**慎用**） |
+
+数据库重置（会清空数据）：
 
 ```bash
-iex -S mix phx.server
+mix ecto.reset
 ```
 
 ## 测试
 
-测试环境使用 **SQLite**（见 `config/test.exs`）：
-
 ```bash
-mix test
+make test
 ```
 
-涉及在测试中启动的 `AgentWorker` 会配合 `Ecto.Adapters.SQL.Sandbox.allow/3` 访问数据库。
+## 设计备忘
 
-## 故障排查
-
-| 现象 | 处理 |
-|------|------|
-| `missing_api_key` | 在 `.fluxclaw/config.json` 填写 `openai.api_key`，或设置 `OPENAI_API_KEY` 后重启 `mix phx.server`。 |
-| 数据库错误 | 执行 `mix ecto.create` 与 `mix ecto.migrate`；开发库路径见 `config/dev.exs`。 |
-| 会话页无流式更新 | 确认已打开 `/chat/:id` 且该会话的 Worker 已 `subscribe`（切换会话会自动切换订阅）。 |
-
-## 仓库结构（节选）
-
-| 路径 | 说明 |
-|------|------|
-| `lib/flux_claw/agents/` | 会话、Orchestrator、`AgentWorker` |
-| `lib/flux_claw_web/live/chat_live.ex` | ChatGPT 式主界面 |
-| `lib/flux_claw/llm/` | LLM 行为与 OpenAI 适配 |
-| `lib/flux_claw/tools/` | 原子工具与沙箱 |
-| `lib/flux_claw/memory.ex` | 技能、检查点查询 |
-| `idea/` | 架构备忘（Erlang 会话 / LiveView 流式） |
+`idea/idea1.md`、`idea/idea2.md` 记录 Erlang 会话与 LiveView 流式相关思路；实现细节以 `docs/` 与代码为准。
 
 ## 许可
 

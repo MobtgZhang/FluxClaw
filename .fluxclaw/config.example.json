@@ -2,7 +2,20 @@
   "openai": {
     "api_key": "sk-你的密钥",
     "base_url": "https://api.openai.com/v1",
-    "model": "gpt-4o-mini"
+    "model": "gpt-4o-mini",
+    "temperature": 0.7,
+    "top_p": 1,
+    "top_k": null
   },
-  "sandbox_root": "./flux_claw_sandbox"
+  "sandbox_root": "./flux_claw_sandbox",
+  "agents": {
+    "max_steps": 32
+  },
+  "cache_paths": {
+    "cache_root": "./fluxclaw/cache",
+    "external_skills": "",
+    "internal_skills": "",
+    "history_root": "",
+    "memory_root": ""
+  }
 }
