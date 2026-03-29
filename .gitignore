@@ -1,3 +1,4 @@
+/idea/
 /_build
 /cover
 /deps
@@ -8,3 +9,8 @@ erl_crash.dump
 *.beam
 /config/*.secret.exs
 .elixir_ls/
+/test/flux_claw_test.db*
+/priv/repo/*.db
+/priv/repo/*.db-*
+/tmp/
+/.fluxclaw/config.json
