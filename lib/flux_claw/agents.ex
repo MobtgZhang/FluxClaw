@@ -68,4 +68,45 @@ defmodule FluxClaw.Agents do
     |> AgentMessage.changeset(Map.put(attrs, :session_id, session_id))
     |> Repo.insert()
   end
+
+  def get_message(id), do: Repo.get(AgentMessage, id)
+
+  def update_message(%AgentMessage{} = m, attrs) do
+    m
+    |> AgentMessage.changeset(attrs)
+    |> Repo.update()
+  end
+
+  def delete_messages_after(%AgentMessage{} = anchor) do
+    from(m in AgentMessage,
+      where: m.session_id == ^anchor.session_id and m.inserted_at > ^anchor.inserted_at
+    )
+    |> Repo.delete_all()
+  end
+
+  @doc """
+  Deletes the assistant message and everything after the preceding user message,
+  so the agent can re-run from that user turn. Returns `:ok` or `{:error, :invalid}`.
+  """
+  def regenerate_from_assistant_message(session_id, assistant_id) do
+    with %AgentMessage{} = assistant <- get_message(assistant_id),
+         true <- to_string(assistant.session_id) == to_string(session_id),
+         "assistant" <- assistant.role,
+         %AgentMessage{role: "user"} = user <-
+           previous_user_message_before(session_id, assistant_id) do
+      _ = delete_messages_after(user)
+      :ok
+    else
+      _ -> {:error, :invalid}
+    end
+  end
+
+  defp previous_user_message_before(session_id, anchor_assistant_id) do
+    session_id
+    |> list_messages()
+    |> Enum.split_while(&(&1.id != anchor_assistant_id))
+    |> elem(0)
+    |> Enum.reverse()
+    |> Enum.find(&(&1.role == "user"))
+  end
 end

@@ -99,7 +99,8 @@ defmodule FluxClaw.Agents.AgentWorker do
     if tc != [] do
       [%{"role" => "assistant", "content" => c || "", "tool_calls" => tc}]
     else
-      db_row_to_llm(%{role: "assistant", content: c, metadata: %{}})
+      # metadata 常为 %{}，不可再递归同一条子句，否则会无限递归
+      assistant_plain_content_to_llm(c)
     end
   end
 
@@ -124,6 +125,11 @@ defmodule FluxClaw.Agents.AgentWorker do
   end
 
   defp db_row_to_llm(_), do: []
+
+  defp assistant_plain_content_to_llm(c) when is_binary(c) and c != "",
+    do: [%{"role" => "assistant", "content" => c}]
+
+  defp assistant_plain_content_to_llm(_), do: []
 
   defp tool_phase(nil), do: nil
 
@@ -178,10 +184,10 @@ defmodule FluxClaw.Agents.AgentWorker do
     })
 
     case Agents.append_message(state.session_id, %{role: "user", content: text}) do
-      {:ok, _} ->
+      {:ok, msg} ->
         _ = maybe_autotitle_session(state.session_id, text)
         conv = state.conversation ++ [%{"role" => "user", "content" => text}]
-        broadcast(state.session_id, {:user, text})
+        broadcast(state.session_id, {:user, text, msg.id})
 
         {:noreply,
          %{state | conversation: conv, step: 0, last_user_text: text, trace: [], l1: %{}},
@@ -303,10 +309,14 @@ defmodule FluxClaw.Agents.AgentWorker do
     text = Map.get(resp, :content) || Map.get(resp, "content") || ""
 
     # Persist before broadcasting assistant_done so LiveView's needs_resume?/DB sees the new tail.
-    _ = persist_assistant_tool_calls(state.session_id, text, calls)
+    assistant_row_id =
+      case persist_assistant_tool_calls(state.session_id, text, calls) do
+        {:ok, msg} -> msg.id
+        _ -> nil
+      end
 
-    if text != "" do
-      broadcast(state.session_id, {:assistant_done, text})
+    if text != "" && assistant_row_id do
+      broadcast(state.session_id, {:assistant_done, text, assistant_row_id})
     end
 
     assistant_msg = assistant_api_message(resp)
@@ -322,14 +332,13 @@ defmodule FluxClaw.Agents.AgentWorker do
            content: text,
            metadata: %{}
          }) do
-      {:ok, _} ->
-        :ok
+      {:ok, msg} ->
+        broadcast(state.session_id, {:assistant_done, text, msg.id})
 
       {:error, e} ->
         Logger.warning("assistant persist failed: #{inspect(e)}")
+        broadcast(state.session_id, {:assistant_done, text, nil})
     end
-
-    broadcast(state.session_id, {:assistant_done, text})
 
     tools_used = trace_tool_names(state.trace)
 
@@ -491,6 +500,8 @@ defmodule FluxClaw.Agents.AgentWorker do
       end
 
     parts = [
+      FluxClaw.Prompts.render_system(state),
+      FluxClaw.Prompts.thinking_instructions(),
       l0,
       l1,
       l2,

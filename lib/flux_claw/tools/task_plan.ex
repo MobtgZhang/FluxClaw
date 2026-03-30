@@ -7,8 +7,7 @@ defmodule FluxClaw.Tools.TaskPlan do
 
   @impl true
   def description do
-    "Publish a short numbered plan for the current task. " <>
-      "Steps are stored as L1 working scratch for this turn and returned to the model."
+    FluxClaw.Prompts.task_plan_tool_description()
   end
 
   @impl true
