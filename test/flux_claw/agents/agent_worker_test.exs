@@ -2,6 +2,7 @@ defmodule FluxClaw.Agents.AgentWorkerTest do
   use FluxClaw.DataCase, async: false
 
   alias FluxClaw.Agents
+  alias FluxClaw.Agents.AgentWorker
   alias FluxClaw.Agents.Orchestrator
 
   setup do
@@ -20,8 +21,22 @@ defmodule FluxClaw.Agents.AgentWorkerTest do
 
     assert :ok = Orchestrator.send_message(session.id, "hi")
 
-    assert_receive {:user, "hi"}
+    assert_receive {:user, "hi", _}
     assert_receive {:assistant_delta, _}
-    assert_receive {:assistant_done, "mock ok"}
+    assert_receive {:assistant_done, "mock ok", _}
+  end
+
+  test "needs_resume? is false when last message is assistant with empty metadata (no stack overflow)" do
+    {:ok, session} = Agents.create_session(%{title: "t"})
+    {:ok, _} = Agents.append_message(session.id, %{role: "user", content: "q"})
+
+    {:ok, _} =
+      Agents.append_message(session.id, %{
+        role: "assistant",
+        content: "final",
+        metadata: %{}
+      })
+
+    refute AgentWorker.needs_resume?(session.id)
   end
 end
