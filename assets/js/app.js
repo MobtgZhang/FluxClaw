@@ -140,6 +140,22 @@ const Hooks = {
           window.open(url, "_blank", "noopener,noreferrer")
         }
       })
+      this.handleEvent("clipboard-copy", ({text}) => {
+        const t = text == null ? "" : String(text)
+        if (t) navigator.clipboard.writeText(t).catch(() => {})
+      })
+      this.handleEvent("download-text", ({filename, text, mime}) => {
+        const t = text == null ? "" : String(text)
+        const blob = new Blob([t], {type: mime || "text/plain;charset=utf-8"})
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = filename || "download.txt"
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        URL.revokeObjectURL(url)
+      })
     },
     destroyed() {
       if (this._externalLinkHandler) {

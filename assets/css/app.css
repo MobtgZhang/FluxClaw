@@ -132,6 +132,8 @@
 .chat-md {
   line-height: 1.65;
   font-size: 15px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 .chat-md p {
   margin: 0.5rem 0;
@@ -179,4 +181,54 @@
   padding-left: 0.75rem;
   border-left: 3px solid color-mix(in oklab, var(--color-primary) 50%, transparent);
   color: color-mix(in oklab, var(--color-base-content) 75%, transparent);
+}
+
+/* Markdown tables: readable borders, header row, zebra */
+.chat-md table {
+  width: 100%;
+  min-width: 12rem;
+  margin: 0.65rem 0;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 0.9em;
+  line-height: 1.45;
+  border-radius: 0.5rem;
+  overflow: hidden;
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--color-base-300) 90%, transparent);
+}
+
+.chat-md thead {
+  background-color: color-mix(in oklab, var(--color-base-300) 55%, transparent);
+}
+
+.chat-md th,
+.chat-md td {
+  border: 1px solid color-mix(in oklab, var(--color-base-300) 85%, transparent);
+  padding: 0.45rem 0.65rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.chat-md th {
+  font-weight: 600;
+  font-size: 0.82em;
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+
+.chat-md tbody tr:nth-child(even) {
+  background-color: color-mix(in oklab, var(--color-base-300) 22%, transparent);
+}
+
+[data-theme="dark"] .chat-md thead {
+  background-color: color-mix(in oklab, var(--color-base-300) 35%, transparent);
+}
+
+[data-theme="dark"] .chat-md th,
+[data-theme="dark"] .chat-md td {
+  border-color: color-mix(in oklab, var(--color-base-300) 50%, transparent);
+}
+
+[data-theme="dark"] .chat-md tbody tr:nth-child(even) {
+  background-color: color-mix(in oklab, var(--color-base-300) 14%, transparent);
 }

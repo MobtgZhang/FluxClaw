@@ -4,6 +4,7 @@ defmodule FluxClawWeb.ChatLive do
   require Logger
 
   alias FluxClaw.Agents
+  alias FluxClaw.Agents.AgentMessage
   alias FluxClaw.Agents.AgentWorker
   alias FluxClaw.Agents.Orchestrator
   alias FluxClaw.Memory
@@ -62,6 +63,9 @@ defmodule FluxClawWeb.ChatLive do
     |> assign(:settings_models, [])
     |> assign(:agent_busy, false)
     |> assign(:chat_subscribed_topic, nil)
+    |> assign(:user_variant_idx, %{})
+    |> assign(:user_edit_meta, %{})
+    |> assign(:editing_user_msg, nil)
   end
 
   defp wire_pubsub_after_static_render(socket) do
@@ -184,6 +188,9 @@ defmodule FluxClawWeb.ChatLive do
     |> assign(:chat_topic, nil)
     |> assign(:chat_subscribed_topic, nil)
     |> assign(:agent_busy, false)
+    |> assign(:user_variant_idx, %{})
+    |> assign(:user_edit_meta, %{})
+    |> assign(:editing_user_msg, nil)
     |> assign(:page_title, "FluxClaw")
     |> then(fn s ->
       case List.first(projects) do
@@ -228,6 +235,9 @@ defmodule FluxClawWeb.ChatLive do
         |> assign(:chat_topic, nil)
         |> assign(:chat_subscribed_topic, nil)
         |> assign(:agent_busy, false)
+        |> assign(:user_variant_idx, %{})
+        |> assign(:user_edit_meta, %{})
+        |> assign(:editing_user_msg, nil)
         |> maybe_unsubscribe(nil)
     end
   end
@@ -248,7 +258,9 @@ defmodule FluxClawWeb.ChatLive do
 
         project = project || List.first(projects)
 
-        log = history_entries(Agents.list_messages(session.id))
+        msgs = Agents.list_messages(session.id)
+        log = history_entries(msgs)
+        user_meta = build_user_edit_meta(msgs)
         checkpoints = Memory.list_checkpoints_for_session(session.id)
 
         skills =
@@ -266,6 +278,9 @@ defmodule FluxClawWeb.ChatLive do
           if(project, do: Agents.list_sessions_for_project(project.id), else: [])
         )
         |> assign(:log, log)
+        |> assign(:user_edit_meta, user_meta)
+        |> assign(:user_variant_idx, %{})
+        |> assign(:editing_user_msg, nil)
         |> assign(:draft_assistant, nil)
         |> assign(:draft_reasoning, nil)
         |> assign(:pending_ask, nil)
@@ -360,7 +375,7 @@ defmodule FluxClawWeb.ChatLive do
         end
 
       "user" ->
-        [{:history, "user", message_content_string(m.content)}]
+        [{:history, "user", message_content_string(m.content), m.id}]
 
       "assistant" ->
         tc = meta_tool_calls_list(m.metadata)
@@ -368,14 +383,14 @@ defmodule FluxClawWeb.ChatLive do
 
         cond do
           tc != [] and c != "" ->
-            [{:history, "assistant", c}]
+            [{:history, "assistant", c, m.id}]
 
           tc != [] ->
             # 仅有 tool_calls、正文为空时仍占一条，避免历史里「用户下一条直接是工具」看起来像丢消息
-            [{:history, "assistant", "（已发起工具调用）"}]
+            [{:history, "assistant", "（已发起工具调用）", m.id}]
 
           true ->
-            if c != "", do: [{:history, "assistant", c}], else: []
+            if c != "", do: [{:history, "assistant", c, m.id}], else: []
         end
 
       _ ->
@@ -1178,6 +1193,193 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, assign(socket, :pending_ask, nil)}
   end
 
+  def handle_event("copy_assistant_text", %{"id" => id_str}, socket) do
+    text = assistant_plaintext_from_db(socket, id_str) || ""
+    {:noreply, push_event(socket, "clipboard-copy", %{text: text})}
+  end
+
+  def handle_event("export_assistant_md", %{"id" => id_str}, socket) do
+    text = assistant_plaintext_from_db(socket, id_str) || ""
+    slug = id_str |> String.trim() |> String.replace("-", "") |> String.slice(0, 8)
+    name = "fluxclaw-reply-#{slug}.md"
+
+    {:noreply,
+     push_event(socket, "download-text", %{
+       filename: name,
+       text: text,
+       mime: "text/markdown;charset=utf-8"
+     })}
+  end
+
+  def handle_event("regenerate_assistant", %{"id" => id_str}, socket) do
+    id_str = String.trim(id_str)
+
+    with %{session: %{id: sid}} <- socket.assigns,
+         {:ok, uuid} <- Ecto.UUID.cast(id_str),
+         :ok <- Agents.regenerate_from_assistant_message(sid, uuid) do
+      stop_session_worker(sid)
+      _ = Orchestrator.ensure_worker(sid)
+
+      socket =
+        socket
+        |> assign(:editing_user_msg, nil)
+        |> assign(:draft_assistant, nil)
+        |> assign(:draft_reasoning, nil)
+        |> reload_chat_from_db()
+        |> assign(:agent_busy, true)
+
+      {:noreply, socket}
+    else
+      {:error, :invalid} ->
+        {:noreply, put_flash(socket, :error, "无法重新生成该条回复")}
+
+      _ ->
+        {:noreply, put_flash(socket, :error, "无法重新生成该条回复")}
+    end
+  end
+
+  def handle_event("copy_user_text", %{"id" => id_str}, socket) do
+    id_str = String.trim(id_str)
+
+    text =
+      chat_slices(
+        socket.assigns.log,
+        socket.assigns.user_edit_meta,
+        socket.assigns.user_variant_idx
+      )
+      |> Enum.find_value(fn
+        {:user_turn, ^id_str, t, _, _, _} -> t
+        _ -> nil
+      end)
+
+    {:noreply, push_event(socket, "clipboard-copy", %{text: text || ""})}
+  end
+
+  def handle_event("start_edit_user", %{"id" => id_str}, socket) do
+    id_str = String.trim(id_str)
+
+    txt =
+      chat_slices(
+        socket.assigns.log,
+        socket.assigns.user_edit_meta,
+        socket.assigns.user_variant_idx
+      )
+      |> Enum.find_value(fn
+        {:user_turn, kid, t, _, _, _} when kid == id_str -> t
+        _ -> nil
+      end)
+
+    case txt do
+      t when is_binary(t) ->
+        case Map.get(socket.assigns.user_edit_meta, id_str) do
+          %{versions: vsn} ->
+            last_i = length(vsn) - 1
+            cur = Map.get(socket.assigns.user_variant_idx, id_str, last_i)
+
+            if cur != last_i do
+              {:noreply, put_flash(socket, :error, "请用「>」切换到最新版本后再修改")}
+            else
+              {:noreply, assign(socket, :editing_user_msg, %{id: id_str, draft: t})}
+            end
+
+          _ ->
+            {:noreply, socket}
+        end
+
+      _ ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_event("cancel_edit_user", _, socket) do
+    {:noreply, assign(socket, :editing_user_msg, nil)}
+  end
+
+  def handle_event("user_variant_step", %{"id" => id_str, "dir" => dir_s}, socket) do
+    dir = String.to_integer(dir_s)
+    id_str = String.trim(id_str)
+
+    case Map.get(socket.assigns.user_edit_meta, id_str) do
+      %{versions: vsn} ->
+        max_i = length(vsn) - 1
+        cur = Map.get(socket.assigns.user_variant_idx, id_str, max_i)
+        next = min(max_i, max(0, cur + dir))
+
+        {:noreply,
+         assign(socket, :user_variant_idx, Map.put(socket.assigns.user_variant_idx, id_str, next))}
+
+      _ ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_event("submit_user_edit", %{"user_message_id" => id_str, "text" => text}, socket) do
+    text = String.trim(text)
+    id_str = String.trim(id_str)
+
+    with %{session: %{id: sid}} <- socket.assigns,
+         false <- text == "",
+         {:ok, uuid} <- Ecto.UUID.cast(id_str),
+         %AgentMessage{} = msg <- Agents.get_message(uuid),
+         true <- to_string(msg.session_id) == to_string(sid),
+         "user" <- msg.role do
+      meta = msg.metadata || %{}
+
+      versions =
+        case meta do
+          %{"edit_versions" => vs} when is_list(vs) and vs != [] -> vs
+          _ -> [message_content_string(msg.content)]
+        end
+
+      snapshots =
+        case meta do
+          %{"edit_snapshots" => ss} when is_list(ss) -> ss
+          _ -> []
+        end
+
+      last_i = length(versions) - 1
+      cur = Map.get(socket.assigns.user_variant_idx, id_str, last_i)
+
+      if cur != last_i do
+        {:noreply, put_flash(socket, :error, "请切换到最新版本后再发送")}
+      else
+        tail = db_tail_log_entries(sid, msg.id)
+        enc = encode_snapshot(tail)
+        new_snapshots = snapshots ++ [enc]
+        new_versions = versions ++ [text]
+
+        new_meta =
+          meta
+          |> Map.put("edit_versions", new_versions)
+          |> Map.put("edit_snapshots", new_snapshots)
+
+        case Agents.update_message(msg, %{content: text, metadata: new_meta}) do
+          {:ok, _} ->
+            _ = Agents.delete_messages_after(msg)
+            stop_session_worker(sid)
+            _ = Orchestrator.ensure_worker(sid)
+
+            socket =
+              socket
+              |> assign(:editing_user_msg, nil)
+              |> reload_chat_from_db()
+
+            nv = Map.fetch!(socket.assigns.user_edit_meta, id_str).versions
+            idx = length(nv) - 1
+
+            vidx = Map.put(socket.assigns.user_variant_idx, id_str, idx)
+
+            {:noreply, assign(socket, :user_variant_idx, vidx)}
+
+          {:error, _} ->
+            {:noreply, put_flash(socket, :error, "保存失败")}
+        end
+      end
+    else
+      _ -> {:noreply, put_flash(socket, :error, "无法保存修改")}
+    end
+  end
+
   defp parse_optional_float(s) when is_binary(s) do
     case Float.parse(String.trim(s)) do
       {f, _} -> f
@@ -1221,8 +1423,24 @@ defmodule FluxClawWeb.ChatLive do
   end
 
   @impl true
+  def handle_info({:user, text, id}, socket) do
+    id_key = to_string(id)
+
+    meta =
+      if Map.has_key?(socket.assigns.user_edit_meta, id_key) do
+        socket.assigns.user_edit_meta
+      else
+        Map.put(socket.assigns.user_edit_meta, id_key, %{versions: [text], snapshots: []})
+      end
+
+    {:noreply,
+     socket
+     |> assign(:user_edit_meta, meta)
+     |> assign(:log, socket.assigns.log ++ [{:user, text, id}])}
+  end
+
   def handle_info({:user, text}, socket) do
-    {:noreply, push_log(socket, {:user, text})}
+    {:noreply, assign(socket, :log, socket.assigns.log ++ [{:user, text, nil}])}
   end
 
   def handle_info({:session_title_updated, title}, socket) do
@@ -1260,8 +1478,14 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, assign(socket, :draft_assistant, cur <> text)}
   end
 
-  def handle_info({:assistant_done, text}, socket) do
-    log = socket.assigns.log ++ [{:assistant, text}]
+  def handle_info({:assistant_done, text, msg_id}, socket) do
+    entry =
+      case msg_id do
+        nil -> {:assistant, text}
+        id -> {:assistant, text, id}
+      end
+
+    log = socket.assigns.log ++ [entry]
 
     socket =
       socket
@@ -1282,6 +1506,10 @@ defmodule FluxClawWeb.ChatLive do
     socket = sync_agent_busy_from_db(socket)
 
     {:noreply, socket}
+  end
+
+  def handle_info({:assistant_done, text}, socket) do
+    handle_info({:assistant_done, text, nil}, socket)
   end
 
   def handle_info({:tool_start, name, args}, socket) do
@@ -1377,6 +1605,276 @@ defmodule FluxClawWeb.ChatLive do
         acc ++ [{:tools, [e]}]
     end
   end
+
+  defp build_user_edit_meta(messages) when is_list(messages) do
+    messages
+    |> Enum.filter(&(&1.role == "user"))
+    |> Map.new(fn m ->
+      id = to_string(m.id)
+      meta = m.metadata || %{}
+
+      versions =
+        case meta do
+          %{"edit_versions" => vs} when is_list(vs) and vs != [] ->
+            vs
+
+          _ ->
+            [message_content_string(m.content)]
+        end
+
+      snapshots =
+        case meta do
+          %{"edit_snapshots" => ss} when is_list(ss) -> ss
+          _ -> []
+        end
+
+      {id, %{versions: versions, snapshots: snapshots}}
+    end)
+  end
+
+  defp user_anchor?({:history, "user", _, _}), do: true
+  defp user_anchor?({:user, _, _}), do: true
+  defp user_anchor?({:user, _}), do: true
+  defp user_anchor?(_), do: false
+
+  defp split_log_by_user_anchors(log) do
+    {prefix, rest} = Enum.split_while(log, &(not user_anchor?(&1)))
+    {prefix, split_user_pairs(rest, [])}
+  end
+
+  defp split_user_pairs([], acc), do: Enum.reverse(acc)
+
+  defp split_user_pairs([u | tail], acc) do
+    if user_anchor?(u) do
+      {mid, rest2} = Enum.split_while(tail, &(not user_anchor?(&1)))
+      split_user_pairs(rest2, [{u, mid} | acc])
+    else
+      split_user_pairs(tail, acc)
+    end
+  end
+
+  defp extract_user_id({:history, "user", _, id}), do: id
+  defp extract_user_id({:user, _, id}), do: id
+  defp extract_user_id({:user, _}), do: nil
+
+  defp extract_user_text({:history, "user", c, _}), do: message_content_string(c)
+  defp extract_user_text({:user, c, _}), do: message_content_string(c)
+  defp extract_user_text({:user, c}), do: message_content_string(c)
+
+  defp chat_slices(log, user_edit_meta, user_variant_idx) do
+    {prefix, pairs} = split_log_by_user_anchors(log)
+
+    prefix_part =
+      if prefix == [] do
+        []
+      else
+        [{:plain, grouped_log_entries(prefix)}]
+      end
+
+    user_parts =
+      Enum.map(pairs, fn {u_entry, mid_entries} ->
+        id = extract_user_id(u_entry)
+        id_key = if id, do: to_string(id), else: nil
+        fallback = extract_user_text(u_entry)
+
+        %{versions: versions, snapshots: snapshots} =
+          if id_key && Map.has_key?(user_edit_meta, id_key) do
+            Map.fetch!(user_edit_meta, id_key)
+          else
+            %{versions: [fallback], snapshots: []}
+          end
+
+        versions = if(versions == [], do: [fallback], else: versions)
+        n = length(versions)
+        max_i = n - 1
+
+        raw_idx =
+          if id_key do
+            Map.get(user_variant_idx, id_key, max_i)
+          else
+            max_i
+          end
+
+        idx = min(max(0, raw_idx), max_i)
+        display_text = Enum.at(versions, idx)
+
+        follow_raw =
+          if idx < max_i do
+            decode_snapshot(Enum.at(snapshots, idx))
+          else
+            mid_entries
+          end
+
+        {:user_turn, id_key, display_text, versions, idx, grouped_log_entries(follow_raw)}
+      end)
+
+    prefix_part ++ user_parts
+  end
+
+  defp encode_snapshot(entries) when is_list(entries) do
+    Jason.encode!(Enum.map(entries, &encode_log_entry/1))
+  end
+
+  defp encode_log_entry({:assistant, c, id}) when not is_nil(id) do
+    %{"k" => "as", "c" => c, "i" => to_string(id)}
+  end
+
+  defp encode_log_entry({:assistant, c}), do: %{"k" => "as", "c" => c}
+
+  defp encode_log_entry({:user, c, id}),
+    do: %{"k" => "u", "c" => c, "i" => to_string(id)}
+
+  defp encode_log_entry({:history, "user", c, id}),
+    do: %{"k" => "hu", "c" => c, "i" => to_string(id)}
+
+  defp encode_log_entry({:history, "assistant", c}), do: %{"k" => "ha", "c" => c}
+
+  defp encode_log_entry({:reasoning, c}), do: %{"k" => "r", "c" => c}
+
+  defp encode_log_entry({:tool_start, n, a}) do
+    %{"k" => "ts", "n" => to_string(n), "a" => json_safe_for_snapshot(a)}
+  end
+
+  defp encode_log_entry({:tool_done, id, n, t}) do
+    %{"k" => "td", "id" => to_string(id), "n" => to_string(n), "t" => t}
+  end
+
+  defp encode_log_entry({:tools, items}) when is_list(items) do
+    %{"k" => "tg", "items" => Enum.map(items, &encode_log_entry/1)}
+  end
+
+  defp encode_log_entry(other) do
+    %{"k" => "raw", "v" => inspect(other)}
+  end
+
+  defp json_safe_for_snapshot(nil), do: nil
+
+  defp json_safe_for_snapshot(v) when is_map(v) do
+    v
+    |> Enum.map(fn {k, val} ->
+      {json_safe_key_str(k), json_safe_for_snapshot(val)}
+    end)
+    |> Map.new()
+  end
+
+  defp json_safe_for_snapshot(v) when is_list(v), do: Enum.map(v, &json_safe_for_snapshot/1)
+
+  defp json_safe_for_snapshot(v) when is_atom(v) do
+    case Atom.to_string(v) do
+      "Elixir." <> rest -> rest
+      s -> s
+    end
+  end
+
+  defp json_safe_for_snapshot(v), do: v
+
+  defp json_safe_key_str(k) when is_atom(k), do: Atom.to_string(k)
+  defp json_safe_key_str(k), do: to_string(k)
+
+  defp decode_snapshot(nil), do: []
+  defp decode_snapshot(""), do: []
+
+  defp decode_snapshot(binary) when is_binary(binary) do
+    case Jason.decode(binary) do
+      {:ok, list} when is_list(list) -> Enum.flat_map(list, &decode_log_entry_map/1)
+      _ -> []
+    end
+  end
+
+  defp decode_snapshot(list) when is_list(list), do: Enum.flat_map(list, &decode_log_entry_map/1)
+  defp decode_snapshot(_), do: []
+
+  defp decode_log_entry_map(m) when is_map(m) do
+    k = Map.get(m, "k") || Map.get(m, :k)
+
+    case k do
+      "as" ->
+        c = Map.get(m, "c") || Map.get(m, :c) || ""
+        i = Map.get(m, "i") || Map.get(m, :i)
+
+        if i && i != "" do
+          [{:assistant, c, i}]
+        else
+          [{:assistant, c}]
+        end
+
+      "u" ->
+        c = Map.get(m, "c") || Map.get(m, :c) || ""
+        i = Map.get(m, "i") || Map.get(m, :i)
+        [{:user, c, i}]
+
+      "hu" ->
+        c = Map.get(m, "c") || Map.get(m, :c) || ""
+        i = Map.get(m, "i") || Map.get(m, :i)
+        [{:history, "user", c, i}]
+
+      "ha" ->
+        [{:history, "assistant", Map.get(m, "c") || Map.get(m, :c) || ""}]
+
+      "r" ->
+        [{:reasoning, Map.get(m, "c") || Map.get(m, :c) || ""}]
+
+      "ts" ->
+        n = Map.get(m, "n") || Map.get(m, :n) || "tool"
+        a = Map.get(m, "a") || Map.get(m, :a) || %{}
+        [{:tool_start, n, a}]
+
+      "td" ->
+        id = Map.get(m, "id") || Map.get(m, :id) || "call"
+        n = Map.get(m, "n") || Map.get(m, :n) || "tool"
+        t = Map.get(m, "t") || Map.get(m, :t) || ""
+        [{:tool_done, id, n, t}]
+
+      "tg" ->
+        items = Map.get(m, "items") || Map.get(m, :items) || []
+        decoded = Enum.flat_map(List.wrap(items), &decode_log_entry_map/1)
+        [{:tools, decoded}]
+
+      _ ->
+        []
+    end
+  end
+
+  defp decode_log_entry_map(_), do: []
+
+  defp db_tail_log_entries(session_id, user_msg_id) do
+    msgs = Agents.list_messages(session_id)
+
+    case Enum.split_while(msgs, &(&1.id != user_msg_id)) do
+      {_, [_anchor | rest]} ->
+        rest
+        |> Enum.take_while(&(&1.role != "user"))
+        |> Enum.flat_map(&message_to_log_fragment/1)
+
+      _ ->
+        []
+    end
+  end
+
+  defp reload_chat_from_db(%{assigns: %{session: %{id: sid}}} = socket) do
+    msgs = Agents.list_messages(sid)
+
+    socket
+    |> assign(:log, history_entries(msgs))
+    |> assign(:user_edit_meta, build_user_edit_meta(msgs))
+    |> assign(:agent_busy, composer_agent_busy?(sid))
+  end
+
+  defp reload_chat_from_db(socket), do: socket
+
+  defp assistant_plaintext_from_db(socket, id_str) when is_binary(id_str) do
+    with %{session: %{id: sid}} <- socket.assigns,
+         {:ok, uuid} <- Ecto.UUID.cast(String.trim(id_str)),
+         %AgentMessage{role: "assistant", content: c, session_id: msid} <-
+           Agents.get_message(uuid),
+         true <- to_string(sid) == to_string(msid) do
+      message_content_string(c)
+    else
+      _ -> nil
+    end
+  end
+
+  defp assistant_plaintext_from_db(_, _), do: nil
 
   defp context_menu_style(%{top: t, right: r}) do
     left = max(8, r - 208)
@@ -1990,12 +2488,26 @@ defmodule FluxClawWeb.ChatLive do
                 class="flex-1 overflow-y-auto px-3 py-6 space-y-5 scroll-smooth max-w-[56rem] mx-auto w-full"
                 data-external-link-event="external_link_click"
               >
-                <%= for entry <- grouped_log_entries(@log) do %>
-                  <%= case entry do %>
-                    <% {:tools, items} -> %>
-                      <.tools_flow_block items={items} />
-                    <% _ -> %>
-                      <.chat_bubble entry={entry} />
+                <%= for slice <- chat_slices(@log, @user_edit_meta, @user_variant_idx) do %>
+                  <%= case slice do %>
+                    <% {:plain, grouped} -> %>
+                      <%= for entry <- grouped do %>
+                        <%= case entry do %>
+                          <% {:tools, items} -> %>
+                            <.tools_flow_block items={items} />
+                          <% _ -> %>
+                            <.chat_bubble entry={entry} />
+                        <% end %>
+                      <% end %>
+                    <% {:user_turn, msg_id, display_text, versions, vidx, grouped_follow} -> %>
+                      <.user_message_block
+                        msg_id={msg_id || ""}
+                        content={display_text}
+                        versions={versions}
+                        variant_idx={vidx}
+                        editing_user={@editing_user_msg}
+                        follow_entries={grouped_follow}
+                      />
                   <% end %>
                 <% end %>
 
@@ -2653,19 +3165,179 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
+  attr :msg_id, :string, default: nil
+  attr :content, :string, required: true
+  attr :versions, :list, required: true
+  attr :variant_idx, :integer, required: true
+  attr :editing_user, :any, default: nil
+  attr :follow_entries, :list, required: true
+
+  def user_message_block(assigns) do
+    editing? =
+      case assigns.editing_user do
+        %{id: id} -> id == assigns.msg_id
+        _ -> false
+      end
+
+    draft =
+      case assigns.editing_user do
+        %{id: id, draft: d} when id == assigns.msg_id -> d
+        _ -> ""
+      end
+
+    n_variants = length(assigns.versions)
+    show_nav = n_variants > 1
+    show_actions = assigns.msg_id not in [nil, ""]
+    can_edit = show_actions && assigns.variant_idx == n_variants - 1
+
+    assigns =
+      assigns
+      |> assign(:editing?, editing?)
+      |> assign(:draft, draft)
+      |> assign(:n_variants, n_variants)
+      |> assign(:show_nav, show_nav)
+      |> assign(:show_actions, show_actions)
+      |> assign(:can_edit, can_edit)
+
+    ~H"""
+    <div class="flex w-full flex-col items-stretch gap-1">
+      <div class="flex w-full justify-end gap-2.5 items-end">
+        <div class="flex min-w-0 max-w-[min(40rem,calc(100%-2.5rem))] flex-1 flex-col items-end">
+          <%= if @editing? do %>
+            <form
+              phx-submit="submit_user_edit"
+              id={"user-edit-form-#{@msg_id}"}
+              class="w-full rounded-2xl rounded-br-md bg-emerald-700 p-3 text-white shadow-sm"
+            >
+              <input type="hidden" name="user_message_id" value={@msg_id} />
+              <textarea
+                name="text"
+                id={"user-edit-ta-#{@msg_id}"}
+                rows="4"
+                class="w-full rounded-lg border border-emerald-500/40 bg-emerald-800/40 px-3 py-2 text-[15px] text-white placeholder:text-emerald-200/60"
+              ><%= @draft %></textarea>
+              <div class="mt-2 flex justify-end gap-2">
+                <button
+                  type="button"
+                  phx-click="cancel_edit_user"
+                  class="rounded-lg px-3 py-1.5 text-sm text-emerald-100 hover:bg-emerald-800/50"
+                >
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  class="rounded-lg bg-white px-3 py-1.5 text-sm font-medium text-emerald-700 hover:bg-emerald-50"
+                >
+                  发送
+                </button>
+              </div>
+            </form>
+          <% else %>
+            <div class="flex w-full max-w-full flex-col items-end">
+              <div class="min-w-0 max-w-full rounded-2xl rounded-br-md bg-emerald-600 px-4 py-2.5 text-[15px] leading-relaxed text-white shadow-sm">
+                <div class="whitespace-pre-wrap">{@content}</div>
+              </div>
+              <%= if @show_actions do %>
+                <div class="mt-1 flex w-full max-w-full flex-row flex-wrap justify-end gap-1">
+                  <button
+                    type="button"
+                    phx-click="copy_user_text"
+                    phx-value-id={@msg_id}
+                    class="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-200/80 [[data-theme=dark]_&]:hover:bg-zinc-700/80"
+                    title="复制"
+                    aria-label="复制"
+                  >
+                    <.icon name="hero-document-duplicate" class="size-4" />
+                  </button>
+                  <%= if @can_edit do %>
+                    <button
+                      type="button"
+                      phx-click="start_edit_user"
+                      phx-value-id={@msg_id}
+                      class="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-200/80 [[data-theme=dark]_&]:hover:bg-zinc-700/80"
+                      title="修改"
+                      aria-label="修改"
+                    >
+                      <.icon name="hero-pencil-square" class="size-4" />
+                    </button>
+                  <% end %>
+                </div>
+              <% end %>
+            </div>
+          <% end %>
+          <%= if @show_nav do %>
+            <div class="mt-1 flex items-center gap-2 self-end text-xs font-mono text-zinc-500 select-none [[data-theme=dark]_&]:text-zinc-400">
+              <button
+                type="button"
+                phx-click="user_variant_step"
+                phx-value-id={@msg_id}
+                phx-value-dir="-1"
+                class={[
+                  "rounded px-2 py-0.5 hover:bg-zinc-200 [[data-theme=dark]_&]:hover:bg-zinc-700",
+                  @variant_idx <= 0 && "pointer-events-none opacity-30"
+                ]}
+              >
+                &lt;
+              </button>
+              <span>{@variant_idx + 1}/{@n_variants}</span>
+              <button
+                type="button"
+                phx-click="user_variant_step"
+                phx-value-id={@msg_id}
+                phx-value-dir="1"
+                class={[
+                  "rounded px-2 py-0.5 hover:bg-zinc-200 [[data-theme=dark]_&]:hover:bg-zinc-700",
+                  @variant_idx >= @n_variants - 1 && "pointer-events-none opacity-30"
+                ]}
+              >
+                &gt;
+              </button>
+            </div>
+          <% end %>
+        </div>
+        <img
+          src={~p"/images/fluxclaw-user.png"}
+          alt=""
+          width="32"
+          height="32"
+          class="mb-0.5 size-8 shrink-0 rounded-full object-cover ring-2 ring-white shadow-sm [[data-theme=dark]_&]:ring-zinc-800"
+        />
+      </div>
+      <div class="w-full space-y-2">
+        <%= for entry <- @follow_entries do %>
+          <%= case entry do %>
+            <% {:tools, items} -> %>
+              <.tools_flow_block items={items} />
+            <% _ -> %>
+              <.chat_bubble entry={entry} />
+          <% end %>
+        <% end %>
+      </div>
+    </div>
+    """
+  end
+
   attr :entry, :any, required: true
 
   def chat_bubble(assigns) do
     ~H"""
     <%= case @entry do %>
+      <% {:history, "user", content, _} -> %>
+        <.bubble_user content={message_content_string(content)} />
       <% {:history, "user", content} -> %>
         <.bubble_user content={message_content_string(content)} />
+      <% {:history, "assistant", content, id} -> %>
+        <.bubble_assistant content={message_content_string(content)} msg_id={to_string(id)} />
       <% {:history, "assistant", content} -> %>
         <.bubble_assistant content={message_content_string(content)} />
       <% {:history, role, content} -> %>
         <.bubble_system role={to_string(role || "")} content={message_content_string(content)} />
+      <% {:user, content, _} -> %>
+        <.bubble_user content={message_content_string(content)} />
       <% {:user, content} -> %>
         <.bubble_user content={message_content_string(content)} />
+      <% {:assistant, content, id} -> %>
+        <.bubble_assistant content={message_content_string(content)} msg_id={to_string(id)} />
       <% {:assistant, content} -> %>
         <.bubble_assistant content={message_content_string(content)} />
       <% {:reasoning, content} -> %>
@@ -2732,13 +3404,15 @@ defmodule FluxClawWeb.ChatLive do
   end
 
   attr :content, :string, required: true
+  attr :msg_id, :string, default: ""
 
   def bubble_assistant(assigns) do
     html = md_html(assigns.content)
-    assigns = assign(assigns, :html, html)
+    show_bar = assigns.msg_id != ""
+    assigns = assigns |> assign(:html, html) |> assign(:show_action_bar, show_bar)
 
     ~H"""
-    <div class="flex justify-start gap-2.5 items-start">
+    <div class="flex w-full min-w-0 justify-start gap-2.5 items-start">
       <img
         src={~p"/images/fluxclaw-assistant.png"}
         alt=""
@@ -2746,8 +3420,44 @@ defmodule FluxClawWeb.ChatLive do
         height="32"
         class="size-8 rounded-full shrink-0 object-cover ring-2 ring-emerald-100 shadow-sm mt-1 [[data-theme=dark]_&]:ring-emerald-900/50"
       />
-      <div class="chat-md min-w-0 flex-1 max-w-[min(48rem,100%)] rounded-2xl rounded-bl-md border border-zinc-200 bg-zinc-50 px-4 py-3 text-[15px] leading-relaxed [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900/60">
-        {raw(@html)}
+      <div class="flex min-w-0 flex-1 max-w-[min(48rem,100%)] flex-col items-stretch">
+        <div class="chat-md rounded-2xl rounded-bl-md border border-zinc-200 bg-zinc-50 px-4 py-3 text-[15px] leading-relaxed [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900/60">
+          {raw(@html)}
+        </div>
+        <%= if @show_action_bar do %>
+          <div class="mt-1 flex flex-row flex-wrap items-center gap-1 self-start">
+            <button
+              type="button"
+              phx-click="copy_assistant_text"
+              phx-value-id={@msg_id}
+              class="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-200/80 [[data-theme=dark]_&]:hover:bg-zinc-700/80"
+              title="复制全文"
+              aria-label="复制全文"
+            >
+              <.icon name="hero-document-duplicate" class="size-4" />
+            </button>
+            <button
+              type="button"
+              phx-click="regenerate_assistant"
+              phx-value-id={@msg_id}
+              class="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-200/80 [[data-theme=dark]_&]:hover:bg-zinc-700/80"
+              title="重新生成"
+              aria-label="重新生成"
+            >
+              <.icon name="hero-arrow-path" class="size-4" />
+            </button>
+            <button
+              type="button"
+              phx-click="export_assistant_md"
+              phx-value-id={@msg_id}
+              class="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-200/80 [[data-theme=dark]_&]:hover:bg-zinc-700/80"
+              title="导出为 Markdown"
+              aria-label="导出为 Markdown"
+            >
+              <.icon name="hero-arrow-down-tray" class="size-4" />
+            </button>
+          </div>
+        <% end %>
       </div>
     </div>
     """
