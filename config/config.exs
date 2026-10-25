@@ -26,6 +26,10 @@ config :flux_claw, :cache_paths,
   history_root: nil,
   memory_root: nil
 
+config :flux_claw, :plugins,
+  cordis_config: nil,
+  node: "node"
+
 config :flux_claw, :memory_l0,
   rules: [
     "You are FluxClaw, a careful assistant with access to tools. Prefer safe, minimal changes.",

@@ -82,7 +82,11 @@ defmodule FluxClaw.MixProject do
       "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
       "ecto.reset": ["ecto.drop", "ecto.setup"],
       test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
-      "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
+      "assets.setup": [
+        "tailwind.install --if-missing",
+        "esbuild.install --if-missing",
+        "plugins.setup"
+      ],
       "assets.build": ["compile", "tailwind flux_claw", "esbuild flux_claw"],
       "assets.deploy": [
         "tailwind flux_claw --minify",
