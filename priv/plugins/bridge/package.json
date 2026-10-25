@@ -1,0 +1,13 @@
+{
+  "name": "fluxclaw-deepseek-harness-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "@deepseek-ai/cordis": "^4.0.5",
+    "@deepseek-ai/dsh-tool-todo": "^0.0.1-rc.1",
+    "tsx": "^4.20.0",
+    "yaml": "^2.9.0"
+  }
+}
