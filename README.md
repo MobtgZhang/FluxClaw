@@ -10,6 +10,7 @@
 - **OTP**：Registry + DynamicSupervisor 按会话拉起 Agent；工具沙箱按会话目录隔离。
 - **LLM**：OpenAI 兼容 Chat Completions，**真实 SSE**（`stream: true`）；测试使用 Mock。
 - **工具**：`file_read` / `file_write` / `file_patch` / `shell_execute` / `web_fetch` / `task_plan` / `ask_user` / `update_working_checkpoint` / `start_long_term_update`（见 `lib/flux_claw/tool.ex`）。
+- **插件**：兼容 DeepSeek Harness（Cordis）工具插件，支持官方 npm 插件与本地 `.mjs` 插件（见 [docs/plugins.md](docs/plugins.md)）。
 - **数据**：SQLite + Ecto — `projects`、`agent_sessions`（含 `project_id`）、`skills`（含 `project_id`、`source`）等。
 - **CI**：`.github/workflows/ci.yml`（参考 `idea/` 中「会话 + 流式」产品方向，落地为 compile / format / test）。
 
@@ -45,6 +46,8 @@ make setup
 ```
 
 环境变量可覆盖文件配置：`OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`、`FLUX_CLAW_SANDBOX`、`FLUXCLAW_MAX_STEPS`（或 JSON 中 `agents.max_steps`，**`-1` 表示不限制轮次**）、`FLUXCLAW_CACHE_EXTERNAL_SKILLS`、`FLUXCLAW_CACHE_INTERNAL_SKILLS`、`FLUXCLAW_CACHE_HISTORY`、`FLUX_CLAW_CONFIG_PATH`。
+
+启用 **DeepSeek Harness 插件** 时，把 **[.fluxclaw/cordis.example.yml](.fluxclaw/cordis.example.yml)** 复制为 **`.fluxclaw/cordis.yml`**，或在 `FLUXCLAW_CORDIS_CONFIG` 中指定配置路径。
 
 ```bash
 make serve

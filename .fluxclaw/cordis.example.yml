@@ -1,0 +1,13 @@
+# Copy this file to .fluxclaw/cordis.yml to load DeepSeek Harness plugins.
+#
+# Official npm plugin example:
+# - id: tool-todo
+#   name: '@deepseek-ai/dsh-tool-todo'
+#   config:
+#     allowParallelInProgress: false
+#
+# Local plugin example:
+# - id: local-greet
+#   name: '/absolute/path/to/my-plugin.js'
+#   config:
+#     greeting: 'Hello'
