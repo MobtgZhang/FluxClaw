@@ -14,6 +14,7 @@ defmodule FluxClaw.Application do
       {Phoenix.PubSub, name: FluxClaw.PubSub},
       {Registry, keys: :unique, name: FluxClaw.Agents.Registry},
       {DynamicSupervisor, strategy: :one_for_one, name: FluxClaw.Agents.AgentSupervisor},
+      FluxClaw.Plugins.CordisRuntime,
       FluxClawWeb.Endpoint
     ]
 

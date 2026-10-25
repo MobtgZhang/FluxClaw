@@ -32,6 +32,49 @@ defmodule FluxClaw.Tool do
   def modules, do: @modules
 
   def openai_tools do
+    builtins =
+      Enum.map(@modules, fn m ->
+        %{
+          type: "function",
+          function: %{
+            name: m.name(),
+            description: m.description(),
+            parameters: m.parameters()
+          }
+        }
+      end)
+
+    builtins ++ FluxClaw.Plugins.CordisRuntime.list_tools()
+  end
+
+  def run(name, args, ctx) when is_binary(name) and is_map(args) do
+    case FluxClaw.Plugins.CordisRuntime.call_tool(name, args, ctx) do
+      {:ok, content} when is_binary(content) ->
+        {:ok, content}
+
+      {:error, :plugin_runtime_unavailable} ->
+        run_builtin(name, args, ctx)
+
+      {:error, "plugin tool not found: " <> _} ->
+        run_builtin(name, args, ctx)
+
+      other ->
+        other
+    end
+  end
+
+  defp run_builtin(name, args, ctx) do
+    mod = Enum.find(@modules, &(&1.name() == name))
+
+    if mod do
+      mod.run(args, ctx)
+    else
+      {:error, "unknown tool #{name}"}
+    end
+  end
+
+  @doc false
+  def openai_tools_without_plugins do
     Enum.map(@modules, fn m ->
       %{
         type: "function",
@@ -42,10 +85,5 @@ defmodule FluxClaw.Tool do
         }
       }
     end)
-  end
-
-  def run(name, args, ctx) when is_binary(name) and is_map(args) do
-    mod = Enum.find(@modules, &(&1.name() == name))
-    if mod, do: mod.run(args, ctx), else: {:error, "unknown tool #{name}"}
   end
 end

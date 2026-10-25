@@ -503,12 +503,19 @@ defmodule FluxClaw.Agents.AgentWorker do
       FluxClaw.Prompts.render_system(state),
       FluxClaw.Prompts.thinking_instructions(),
       l0,
+      plugin_prompt_sections(),
       l1,
       l2,
       if(l3 != "", do: "Relevant skills (L3):\n" <> l3, else: "")
     ]
 
     %{"role" => "system", "content" => parts |> Enum.reject(&(&1 == "")) |> Enum.join("\n\n")}
+  end
+
+  defp plugin_prompt_sections do
+    FluxClaw.Plugins.CordisRuntime.prompt_sections()
+    |> Enum.sort_by(& &1[:priority])
+    |> Enum.map_join("\n\n", fn section -> "## #{section[:title]}\n#{section[:content]}" end)
   end
 
   defp maybe_crystallize(state) do
