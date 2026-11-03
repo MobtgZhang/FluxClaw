@@ -29,7 +29,9 @@
 公开资料中 OpenClaw 系实践强调：**失败反馈、分层记忆、人在回路（批准后再写入）**。FluxClaw 中对应钩子包括：
 
 - `ask_user` 工具：高风险操作前暂停等待用户输入。
+- `file_write` / `file_patch` / `apply_patch` 的 Diff 审查（见 `tools-and-safety.md`）：修改经确认后才写盘。
 - `crystallize_skills` + `crystallize_mode: :confirm`：在确认模式下不直接写入技能，而是向 UI 发送 `skill_proposal`，由用户显式「接受并保存」后再 `Memory.create_skill/1`。
+- `promote_checkpoint` 工具 + `Memory.promote_checkpoint_to_skill/2`：把表现良好的工作检查点（L1/L2）显式结晶为 L3 技能，形成「检查点 → 技能」的自进化路径。
 - 外部 skills 目录：便于与 Cursor / 仓库内 Markdown 技能库对齐，实现「检索增强」而非仅数据库。
 
 配置见 `config/config.exs` 中 `:agents` 与 `:cache_paths`。`agents.max_steps` 为 **`-1`** 时表示不在 Worker 内限制 LLM↔工具循环轮次（内部用大上限实现）；正整数为硬上限。

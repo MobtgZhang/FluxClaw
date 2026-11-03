@@ -62,6 +62,11 @@ defmodule FluxClawWeb.ChatLive do
     |> assign(:memory_doc_files, [])
     |> assign(:settings_models, [])
     |> assign(:agent_busy, false)
+    |> assign(:sidebar_collapsed, false)
+    |> assign(:right_open, true)
+    |> assign(:right_tab, :plugins)
+    |> assign(:pending_diff, nil)
+    |> assign(:plugins_info, plugins_summary())
     |> assign(:chat_subscribed_topic, nil)
     |> assign(:user_variant_idx, %{})
     |> assign(:user_edit_meta, %{})
@@ -69,7 +74,10 @@ defmodule FluxClawWeb.ChatLive do
   end
 
   defp wire_pubsub_after_static_render(socket) do
-    if connected?(socket) && match?(%{id: _}, socket.assigns[:session]) do
+    if connected?(socket) && socket.assigns[:plugins_subscribed] != true do
+      Phoenix.PubSub.subscribe(FluxClaw.PubSub, "flux_claw:plugins")
+      socket = assign(socket, :plugins_subscribed, true)
+
       socket
       |> subscribe_session(socket.assigns.session.id)
       |> assign(:agent_busy, composer_agent_busy?(socket.assigns.session.id))
@@ -188,6 +196,7 @@ defmodule FluxClawWeb.ChatLive do
     |> assign(:chat_topic, nil)
     |> assign(:chat_subscribed_topic, nil)
     |> assign(:agent_busy, false)
+    |> assign(:pending_diff, nil)
     |> assign(:user_variant_idx, %{})
     |> assign(:user_edit_meta, %{})
     |> assign(:editing_user_msg, nil)
@@ -235,6 +244,7 @@ defmodule FluxClawWeb.ChatLive do
         |> assign(:chat_topic, nil)
         |> assign(:chat_subscribed_topic, nil)
         |> assign(:agent_busy, false)
+        |> assign(:pending_diff, nil)
         |> assign(:user_variant_idx, %{})
         |> assign(:user_edit_meta, %{})
         |> assign(:editing_user_msg, nil)
@@ -284,6 +294,7 @@ defmodule FluxClawWeb.ChatLive do
         |> assign(:draft_assistant, nil)
         |> assign(:draft_reasoning, nil)
         |> assign(:pending_ask, nil)
+        |> assign(:pending_diff, nil)
         |> assign(:checkpoints, checkpoints)
         |> assign(:skills_sidebar, skills)
         |> assign(:memory_doc_files, Memory.list_memory_markdown_docs())
@@ -411,8 +422,6 @@ defmodule FluxClawWeb.ChatLive do
   end
 
   defp meta_phase(_), do: nil
-
-  defp meta_call_id(nil), do: "call"
 
   defp meta_call_id(meta) when is_map(meta) do
     Map.get(meta, "call_id") || Map.get(meta, :call_id) || "call"
@@ -1193,6 +1202,47 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, assign(socket, :pending_ask, nil)}
   end
 
+  def handle_event("toggle_sidebar_rail", _params, socket) do
+    {:noreply, update(socket, :sidebar_collapsed, &(!&1))}
+  end
+
+  def handle_event("toggle_right", _params, socket) do
+    {:noreply, update(socket, :right_open, &(!&1))}
+  end
+
+  def handle_event("set_right_tab", %{"tab" => tab}, socket) do
+    tab =
+      case tab do
+        "timeline" -> :timeline
+        "memory" -> :memory
+        "plugins" -> :plugins
+        _ -> :plugins
+      end
+
+    {:noreply, socket |> assign(:right_tab, tab) |> assign(:right_open, true)}
+  end
+
+  def handle_event("review_diff", %{"ref" => ref_str, "decision" => decision}, socket) do
+    ref = String.to_integer(ref_str)
+    decision = if decision in ["keep", "accept", "apply", "true"], do: "keep", else: "reject"
+
+    socket =
+      case socket.assigns.session do
+        %{id: sid} ->
+          Orchestrator.reply_diff_review(sid, ref, decision)
+          assign(socket, :agent_busy, true)
+
+        _ ->
+          socket
+      end
+
+    {:noreply, assign(socket, :pending_diff, nil)}
+  end
+
+  def handle_event("refresh_plugins", _params, socket) do
+    {:noreply, refresh_plugins_info(socket)}
+  end
+
   def handle_event("copy_assistant_text", %{"id" => id_str}, socket) do
     text = assistant_plaintext_from_db(socket, id_str) || ""
     {:noreply, push_event(socket, "clipboard-copy", %{text: text})}
@@ -1422,6 +1472,22 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
+  defp refresh_plugins_info(socket) do
+    assign(socket, :plugins_info, plugins_summary())
+  end
+
+  defp plugins_summary do
+    FluxClaw.Plugins.summary()
+  rescue
+    e -> %{error: Exception.message(e)}
+  end
+
+  defp diff_lines(diff) when is_binary(diff) do
+    FluxClaw.Tools.Diff.diff_lines(diff)
+  end
+
+  defp diff_lines(_), do: []
+
   @impl true
   def handle_info({:user, text, id}, socket) do
     id_key = to_string(id)
@@ -1546,6 +1612,33 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, socket |> put_flash(:error, inspect(reason)) |> assign(:agent_busy, false)}
   end
 
+  def handle_info({:diff_proposed, ref, payload}, socket) do
+    pending = Map.put(Map.new(payload || %{}), "ref", ref)
+
+    {:noreply,
+     socket
+     |> assign(:pending_diff, pending)
+     |> assign(:agent_busy, false)}
+  end
+
+  def handle_info({:diff_reviewed, _ref, _decision}, socket) do
+    socket = sync_agent_busy_from_db(socket)
+
+    {:noreply, assign(socket, :pending_diff, nil)}
+  end
+
+  def handle_info({:plugin_loaded, _id}, socket) do
+    {:noreply, refresh_plugins_info(socket)}
+  end
+
+  def handle_info({:plugin_tool_registered, _plugin_id, _name}, socket) do
+    {:noreply, refresh_plugins_info(socket)}
+  end
+
+  def handle_info({:plugin_tool_unregistered, _name}, socket) do
+    {:noreply, refresh_plugins_info(socket)}
+  end
+
   def handle_info(_other, socket), do: {:noreply, socket}
 
   defp push_log(socket, entry) do
@@ -1570,8 +1663,6 @@ defmodule FluxClawWeb.ChatLive do
   defp worker_running?(session_id) when is_binary(session_id) do
     match?([{_pid, _}], Registry.lookup(FluxClaw.Agents.Registry, session_id))
   end
-
-  defp worker_running?(_), do: false
 
   defp stop_session_worker(session_id) do
     case Registry.lookup(FluxClaw.Agents.Registry, session_id) do
@@ -1894,27 +1985,91 @@ defmodule FluxClawWeb.ChatLive do
   def render(assigns) do
     ~H"""
     <Layouts.app flash={@flash} current_scope={nil} variant={:bare}>
-      <div class="flex h-dvh flex-col bg-zinc-100 text-zinc-900 overflow-hidden [[data-theme=dark]_&]:bg-zinc-950 [[data-theme=dark]_&]:text-zinc-100">
-        <div class="flex flex-1 min-h-0 relative">
-          <div
-            :if={@sidebar_open}
-            class="fixed inset-0 z-40 bg-black/40 lg:hidden"
-            phx-click="toggle_sidebar"
-          >
+      <div
+        id="app-frame"
+        class="flex h-dvh overflow-hidden bg-zinc-100 text-zinc-900 [[data-theme=dark]_&]:bg-zinc-950 [[data-theme=dark]_&]:text-zinc-100"
+      >
+        <div
+          :if={@sidebar_open}
+          class="fixed inset-0 z-40 bg-black/40 lg:hidden"
+          phx-click="toggle_sidebar"
+        >
+        </div>
+
+        <aside
+          class={[
+            "fixed lg:static inset-y-0 left-0 z-50 flex flex-col border-r border-zinc-200/80 bg-white transition-transform duration-200 [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900 lg:translate-x-0",
+            if(@sidebar_open, do: "translate-x-0", else: "-translate-x-full"),
+            if(@sidebar_collapsed, do: "w-14", else: "w-[min(17.5rem,88vw)] lg:w-[17.5rem]")
+          ]}
+          id="sidebar-root"
+        >
+          <div class="flex h-12 items-center gap-2 border-b border-zinc-200/80 px-3 shrink-0 [[data-theme=dark]_&]:border-zinc-800">
+            <%= if @sidebar_collapsed do %>
+              <button
+                type="button"
+                phx-click="toggle_sidebar_rail"
+                class="rounded-lg p-2 text-zinc-600 hover:bg-zinc-100 [[data-theme=dark]_&]:text-zinc-300 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                title="展开侧栏"
+                aria-label="展开侧栏"
+              >
+                <.icon name="hero-ellipsis-horizontal" class="size-5" />
+              </button>
+            <% else %>
+              <span class="flex items-center gap-2 font-semibold tracking-tight text-[15px]">
+                <img src={~p"/images/fluxclaw-assistant.png"} alt="" class="size-6 rounded-md" />
+                FluxClaw
+              </span>
+              <span class="ml-auto text-[10px] font-medium uppercase tracking-wider text-zinc-400">
+                agent
+              </span>
+            <% end %>
           </div>
 
-          <aside
-            class={[
-              "fixed lg:static inset-y-0 left-0 z-50 flex w-[min(17.5rem,88vw)] flex-col border-r border-zinc-200/80 bg-white [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900 transition-transform duration-200 lg:translate-x-0",
-              if(@sidebar_open, do: "translate-x-0", else: "-translate-x-full")
-            ]}
-            id="sidebar-root"
-          >
-            <div class="flex h-12 items-center gap-2 border-b border-zinc-200/80 px-3 shrink-0 [[data-theme=dark]_&]:border-zinc-800">
-              <span class="font-semibold tracking-tight text-[15px]">FluxClaw</span>
+          <%= if @sidebar_collapsed do %>
+            <div class="flex flex-1 flex-col items-center gap-1 py-2">
+              <button
+                type="button"
+                phx-click="new_chat"
+                class="rounded-lg p-2 text-emerald-600 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                title="新建对话"
+                aria-label="新建对话"
+              >
+                <.icon name="hero-plus" class="size-5" />
+              </button>
+              <button
+                type="button"
+                phx-click="toggle_nav"
+                phx-value-section="projects"
+                class="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                title="项目 / 对话"
+                aria-label="项目"
+              >
+                <.icon name="hero-folder" class="size-5" />
+              </button>
+              <button
+                type="button"
+                phx-click="toggle_nav"
+                phx-value-section="skills"
+                class="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                title="技能 (L3)"
+                aria-label="技能"
+              >
+                <.icon name="hero-bolt" class="size-5" />
+              </button>
+              <button
+                type="button"
+                phx-click="toggle_nav"
+                phx-value-section="memory"
+                class="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                title="Memory 文档"
+                aria-label="Memory"
+              >
+                <.icon name="hero-book-open" class="size-5" />
+              </button>
             </div>
-
-            <div class="flex-1 flex flex-col min-h-0 overflow-hidden">
+          <% else %>
+            <div class="flex flex-1 flex-col min-h-0 overflow-hidden">
               <section class="flex flex-col min-h-0 border-b border-zinc-100 [[data-theme=dark]_&]:border-zinc-800 shrink-0 max-h-[32vh]">
                 <div class="flex items-center gap-1 px-2 py-2 shrink-0">
                   <button
@@ -2130,553 +2285,1002 @@ defmodule FluxClawWeb.ChatLive do
                 </div>
               </section>
             </div>
-
-            <div class="border-t border-zinc-200/80 p-2 flex items-center justify-between gap-2 shrink-0 [[data-theme=dark]_&]:border-zinc-800">
-              <button
-                type="button"
-                phx-click="toggle_settings"
-                class="flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm text-zinc-600 hover:bg-zinc-100 [[data-theme=dark]_&]:text-zinc-300 [[data-theme=dark]_&]:hover:bg-zinc-800"
-              >
-                <.icon name="hero-cog-6-tooth" class="size-5" /> 设置
-              </button>
-              <button
-                type="button"
-                id="fluxclaw-theme-toggle"
-                phx-hook="ThemeToggle"
-                class="rounded-lg border border-zinc-200 p-2 text-zinc-600 hover:bg-zinc-100 [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:text-zinc-300 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                title="切换浅色 / 深色"
-              >
-                <span data-theme-icon="moon" class="block">
-                  <.icon name="hero-moon" class="size-5 text-indigo-500" />
-                </span>
-                <span data-theme-icon="sun" class="hidden">
-                  <.icon name="hero-sun" class="size-5 text-amber-500" />
-                </span>
-              </button>
-            </div>
-          </aside>
-
-          <%= if @context_menu && @menu_anchor do %>
-            <div class="fixed inset-0 z-[580]" phx-click="close_menu"></div>
-            <div
-              class="fixed z-[590] w-52 max-h-[min(70vh,24rem)] overflow-y-auto rounded-xl border border-zinc-200 bg-white py-1 shadow-2xl [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:bg-zinc-900"
-              style={context_menu_style(@menu_anchor)}
-            >
-              <%= case @context_menu do %>
-                <% {"project", id} -> %>
-                  <button
-                    type="button"
-                    phx-click="start_edit"
-                    phx-value-kind="project"
-                    phx-value-id={id}
-                    class="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                  >
-                    重命名
-                  </button>
-                  <button
-                    type="button"
-                    phx-click="delete_project"
-                    phx-value-id={id}
-                    class="block w-full px-3 py-2 text-left text-sm text-red-600 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                  >
-                    删除
-                  </button>
-                <% {"session", id} -> %>
-                  <button
-                    type="button"
-                    phx-click="start_edit"
-                    phx-value-kind="session"
-                    phx-value-id={id}
-                    class="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                  >
-                    重命名
-                  </button>
-                  <button
-                    type="button"
-                    phx-click="open_move"
-                    phx-value-type="session"
-                    phx-value-id={id}
-                    class="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                  >
-                    移动到项目…
-                  </button>
-                  <button
-                    type="button"
-                    phx-click="delete_session"
-                    phx-value-id={id}
-                    class="block w-full px-3 py-2 text-left text-sm text-red-600 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                  >
-                    删除
-                  </button>
-                <% {"skill", id} -> %>
-                  <button
-                    type="button"
-                    phx-click="open_skill_editor"
-                    phx-value-id={id}
-                    class="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                  >
-                    编辑
-                  </button>
-                  <button
-                    type="button"
-                    phx-click="open_move"
-                    phx-value-type="skill"
-                    phx-value-id={id}
-                    class="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                  >
-                    移动到项目…
-                  </button>
-                  <button
-                    type="button"
-                    phx-click="delete_skill"
-                    phx-value-id={id}
-                    class="block w-full px-3 py-2 text-left text-sm text-red-600 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                  >
-                    删除
-                  </button>
-                <% _ -> %>
-              <% end %>
-            </div>
           <% end %>
 
-          <%= if @skill_editor do %>
-            <div
-              class="fixed inset-0 z-[52] bg-black/40 lg:left-[min(17.5rem,88vw)]"
-              phx-click="close_skill_editor"
+          <div class="border-t border-zinc-200/80 p-2 flex items-center justify-between gap-2 shrink-0 [[data-theme=dark]_&]:border-zinc-800">
+            <button
+              type="button"
+              phx-click="toggle_settings"
+              class="flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm text-zinc-600 hover:bg-zinc-100 [[data-theme=dark]_&]:text-zinc-300 [[data-theme=dark]_&]:hover:bg-zinc-800"
             >
+              <.icon name="hero-cog-6-tooth" class="size-5" />
+              <span :if={!@sidebar_collapsed}>设置</span>
+            </button>
+            <button
+              type="button"
+              id="fluxclaw-theme-toggle"
+              phx-hook="ThemeToggle"
+              class="rounded-lg border border-zinc-200 p-2 text-zinc-600 hover:bg-zinc-100 [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:text-zinc-300 [[data-theme=dark]_&]:hover:bg-zinc-800"
+              title="切换浅色 / 深色"
+            >
+              <span data-theme-icon="moon" class="hidden block">
+                <.icon name="hero-moon" class="size-5 text-indigo-500" />
+              </span>
+              <span data-theme-icon="sun" class="hidden">
+                <.icon name="hero-sun" class="size-5 text-amber-500" />
+              </span>
+            </button>
+          </div>
+        </aside>
+
+        <%= if @context_menu && @menu_anchor do %>
+          <div class="fixed inset-0 z-[580]" phx-click="close_menu"></div>
+          <div
+            class="fixed z-[590] w-52 max-h-[min(70vh,24rem)] overflow-y-auto rounded-xl border border-zinc-200 bg-white py-1 shadow-2xl [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:bg-zinc-900"
+            style={context_menu_style(@menu_anchor)}
+          >
+            <%= case @context_menu do %>
+              <% {"project", id} -> %>
+                <button
+                  type="button"
+                  phx-click="start_edit"
+                  phx-value-kind="project"
+                  phx-value-id={id}
+                  class="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                >
+                  重命名
+                </button>
+                <button
+                  type="button"
+                  phx-click="delete_project"
+                  phx-value-id={id}
+                  class="block w-full px-3 py-2 text-left text-sm text-red-600 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                >
+                  删除
+                </button>
+              <% {"session", id} -> %>
+                <button
+                  type="button"
+                  phx-click="start_edit"
+                  phx-value-kind="session"
+                  phx-value-id={id}
+                  class="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                >
+                  重命名
+                </button>
+                <button
+                  type="button"
+                  phx-click="open_move"
+                  phx-value-type="session"
+                  phx-value-id={id}
+                  class="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                >
+                  移动到项目…
+                </button>
+                <button
+                  type="button"
+                  phx-click="delete_session"
+                  phx-value-id={id}
+                  class="block w-full px-3 py-2 text-left text-sm text-red-600 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                >
+                  删除
+                </button>
+              <% {"skill", id} -> %>
+                <button
+                  type="button"
+                  phx-click="open_skill_editor"
+                  phx-value-id={id}
+                  class="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                >
+                  编辑
+                </button>
+                <button
+                  type="button"
+                  phx-click="open_move"
+                  phx-value-type="skill"
+                  phx-value-id={id}
+                  class="block w-full px-3 py-2 text-left text-sm hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                >
+                  移动到项目…
+                </button>
+                <button
+                  type="button"
+                  phx-click="delete_skill"
+                  phx-value-id={id}
+                  class="block w-full px-3 py-2 text-left text-sm text-red-600 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                >
+                  删除
+                </button>
+              <% _ -> %>
+            <% end %>
+          </div>
+        <% end %>
+
+        <%= if @skill_editor do %>
+          <div
+            class="fixed inset-0 z-[52] bg-black/40 lg:left-[17.5rem]"
+            phx-click="close_skill_editor"
+          >
+          </div>
+          <aside
+            class={[
+              "fixed top-0 bottom-0 z-[53] flex w-[min(52rem,100vw)] flex-col border-r border-zinc-200 bg-white shadow-2xl transition-transform duration-300 ease-out [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900",
+              "left-0 lg:left-[17.5rem] translate-x-0"
+            ]}
+            id="skill-editor-drawer"
+          >
+            <div class="flex h-12 items-center justify-between border-b border-zinc-200 px-3 shrink-0 [[data-theme=dark]_&]:border-zinc-800">
+              <span class="font-semibold text-sm">
+                {if(@skill_editor.id, do: "编辑技能", else: "新建技能")}
+              </span>
+              <button
+                type="button"
+                phx-click="close_skill_editor"
+                class="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                aria-label="关闭"
+              >
+                <.icon name="hero-x-mark" class="size-5" />
+              </button>
             </div>
-            <aside
-              class={[
-                "fixed top-0 bottom-0 z-[53] flex w-[min(52rem,100vw)] flex-col border-r border-zinc-200 bg-white shadow-2xl transition-transform duration-300 ease-out [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900",
-                "left-0 lg:left-[min(17.5rem,88vw)] translate-x-0"
-              ]}
-              id="skill-editor-drawer"
+            <form
+              phx-submit="save_skill_editor"
+              id="skill-editor-form"
+              class="flex flex-1 flex-col min-h-0 p-3 gap-3"
             >
-              <div class="flex h-12 items-center justify-between border-b border-zinc-200 px-3 shrink-0 [[data-theme=dark]_&]:border-zinc-800">
-                <span class="font-semibold text-sm">
-                  {if(@skill_editor.id, do: "编辑技能", else: "新建技能")}
-                </span>
+              <input type="hidden" name="skill_id" value={@skill_editor.id || ""} />
+              <div>
+                <label class="block text-xs font-medium text-zinc-500 mb-1" for="skill-editor-title">
+                  标题
+                </label>
+                <input
+                  type="text"
+                  name="title"
+                  id="skill-editor-title"
+                  value={@skill_editor.title}
+                  required
+                  class="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm [[data-theme=dark]_&]:border-zinc-600 [[data-theme=dark]_&]:bg-zinc-800"
+                />
+              </div>
+              <div>
+                <label
+                  class="block text-xs font-medium text-zinc-500 mb-1"
+                  for="skill-editor-keywords"
+                >
+                  关键词（可选）
+                </label>
+                <input
+                  type="text"
+                  name="keywords"
+                  id="skill-editor-keywords"
+                  value={@skill_editor.keywords}
+                  class="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm [[data-theme=dark]_&]:border-zinc-600 [[data-theme=dark]_&]:bg-zinc-800"
+                />
+              </div>
+              <div class="flex-1 flex flex-col min-h-0 min-h-[22rem]">
+                <label class="block text-xs font-medium text-zinc-500 mb-1" for="skill-editor-body">
+                  正文（Markdown，工具栏支持预览 / 分栏）
+                </label>
+                <div
+                  id="skill-mde-mount"
+                  phx-update="ignore"
+                  phx-hook="MarkdownEditor"
+                  class="flex-1 min-h-[18rem] rounded-lg border border-zinc-200 overflow-hidden [[data-theme=dark]_&]:border-zinc-700"
+                >
+                  <textarea
+                    name="body"
+                    id="skill-editor-body"
+                    class="w-full min-h-[16rem] text-sm font-mono"
+                  ></textarea>
+                </div>
+              </div>
+              <div class="flex gap-2 justify-end shrink-0 pt-1">
                 <button
                   type="button"
                   phx-click="close_skill_editor"
-                  class="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                  aria-label="关闭"
+                  class="rounded-lg border border-zinc-300 px-4 py-2 text-sm [[data-theme=dark]_&]:border-zinc-600"
                 >
-                  <.icon name="hero-x-mark" class="size-5" />
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  class="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
+                >
+                  保存
                 </button>
               </div>
-              <form
-                phx-submit="save_skill_editor"
-                id="skill-editor-form"
-                class="flex flex-1 flex-col min-h-0 p-3 gap-3"
+            </form>
+          </aside>
+        <% end %>
+
+        <main class="relative flex flex-1 flex-col min-w-0 min-h-0 bg-white [[data-theme=dark]_&]:bg-zinc-950">
+          <header class="flex h-12 items-center gap-1.5 border-b border-zinc-200/80 px-3 shrink-0 [[data-theme=dark]_&]:border-zinc-800">
+            <button
+              type="button"
+              phx-click="toggle_sidebar"
+              class="rounded-lg p-2 text-zinc-600 hover:bg-zinc-100 lg:hidden [[data-theme=dark]_&]:text-zinc-300 [[data-theme=dark]_&]:hover:bg-zinc-800"
+              aria-label="菜单"
+            >
+              <.icon name="hero-bars-3" class="size-5" />
+            </button>
+            <button
+              type="button"
+              phx-click="toggle_sidebar_rail"
+              class="hidden lg:block rounded-lg p-2 text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:text-zinc-300 [[data-theme=dark]_&]:hover:bg-zinc-800"
+              title={if(@sidebar_collapsed, do: "展开侧栏", else: "收起侧栏")}
+              aria-label="收起 / 展开侧栏"
+            >
+              <.icon
+                name={
+                  if(@sidebar_collapsed,
+                    do: "hero-ellipsis-horizontal",
+                    else: "hero-bars-3-center-left"
+                  )
+                }
+                class="size-5"
+              />
+            </button>
+            <div class="flex-1 min-w-0 px-1">
+              <h1 class="text-[15px] font-semibold truncate">
+                {(@session && @session.title) || (@project && @project.title) || "选择项目或对话"}
+              </h1>
+            </div>
+            <div class="flex items-center gap-1 shrink-0">
+              <button
+                type="button"
+                phx-click="set_right_tab"
+                phx-value-tab="timeline"
+                class={[
+                  "rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors",
+                  @right_tab == :timeline &&
+                    "bg-zinc-200/90 text-zinc-800 [[data-theme=dark]_&]:bg-zinc-800 [[data-theme=dark]_&]:text-zinc-100",
+                  @right_tab != :timeline &&
+                    "text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                ]}
               >
-                <input type="hidden" name="skill_id" value={@skill_editor.id || ""} />
-                <div>
-                  <label class="block text-xs font-medium text-zinc-500 mb-1" for="skill-editor-title">
-                    标题
-                  </label>
-                  <input
-                    type="text"
-                    name="title"
-                    id="skill-editor-title"
-                    value={@skill_editor.title}
-                    required
-                    class="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm [[data-theme=dark]_&]:border-zinc-600 [[data-theme=dark]_&]:bg-zinc-800"
-                  />
-                </div>
-                <div>
-                  <label
-                    class="block text-xs font-medium text-zinc-500 mb-1"
-                    for="skill-editor-keywords"
-                  >
-                    关键词（可选）
-                  </label>
-                  <input
-                    type="text"
-                    name="keywords"
-                    id="skill-editor-keywords"
-                    value={@skill_editor.keywords}
-                    class="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm [[data-theme=dark]_&]:border-zinc-600 [[data-theme=dark]_&]:bg-zinc-800"
-                  />
-                </div>
-                <div class="flex-1 flex flex-col min-h-0 min-h-[22rem]">
-                  <label class="block text-xs font-medium text-zinc-500 mb-1" for="skill-editor-body">
-                    正文（Markdown，工具栏支持预览 / 分栏）
-                  </label>
-                  <div
-                    id="skill-mde-mount"
-                    phx-update="ignore"
-                    phx-hook="MarkdownEditor"
-                    class="flex-1 min-h-[18rem] rounded-lg border border-zinc-200 overflow-hidden [[data-theme=dark]_&]:border-zinc-700"
-                  >
-                    <textarea
-                      name="body"
-                      id="skill-editor-body"
-                      class="w-full min-h-[16rem] text-sm font-mono"
-                    ></textarea>
-                  </div>
-                </div>
-                <div class="flex gap-2 justify-end shrink-0 pt-1">
+                轨迹
+              </button>
+              <button
+                type="button"
+                phx-click="set_right_tab"
+                phx-value-tab="memory"
+                class={[
+                  "rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors",
+                  @right_tab == :memory &&
+                    "bg-zinc-200/90 text-zinc-800 [[data-theme=dark]_&]:bg-zinc-800 [[data-theme=dark]_&]:text-zinc-100",
+                  @right_tab != :memory &&
+                    "text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                ]}
+              >
+                记忆
+              </button>
+              <button
+                type="button"
+                phx-click="set_right_tab"
+                phx-value-tab="plugins"
+                class={[
+                  "rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors",
+                  @right_tab == :plugins &&
+                    "bg-zinc-200/90 text-zinc-800 [[data-theme=dark]_&]:bg-zinc-800 [[data-theme=dark]_&]:text-zinc-100",
+                  @right_tab != :plugins &&
+                    "text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                ]}
+              >
+                插件
+              </button>
+              <button
+                type="button"
+                phx-click="toggle_right"
+                class="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                title={if(@right_open, do: "隐藏面板", else: "显示面板")}
+                aria-label="切换右侧面板"
+              >
+                <.icon
+                  name={
+                    if(@right_open,
+                      do: "hero-arrow-right-on-rectangle",
+                      else: "hero-bars-3-center-left"
+                    )
+                  }
+                  class="size-5"
+                />
+              </button>
+            </div>
+          </header>
+
+          <%= if @skill_proposal do %>
+            <div class="shrink-0 border-b border-amber-200/80 bg-amber-50 px-4 py-3 text-sm [[data-theme=dark]_&]:border-amber-900/50 [[data-theme=dark]_&]:bg-amber-950/40">
+              <p class="font-medium text-amber-900 [[data-theme=dark]_&]:text-amber-200">
+                建议保存新技能（需确认）
+              </p>
+              <p class="text-zinc-700 mt-1 truncate [[data-theme=dark]_&]:text-zinc-300">
+                {@skill_proposal.title}
+              </p>
+              <div class="mt-2 flex gap-2">
+                <button
+                  type="button"
+                  phx-click="accept_skill_proposal"
+                  class="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
+                >
+                  接受并保存
+                </button>
+                <button
+                  type="button"
+                  phx-click="dismiss_skill_proposal"
+                  class="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs [[data-theme=dark]_&]:border-zinc-600"
+                >
+                  忽略
+                </button>
+              </div>
+            </div>
+          <% end %>
+
+          <%= if @move_target do %>
+            <.move_project_modal
+              projects={@projects}
+              move_target={@move_target}
+              current_project={@project}
+            />
+          <% end %>
+
+          <%= if @editing do %>
+            <.edit_modal editing={@editing} projects={@projects} sessions={@sessions} />
+          <% end %>
+
+          <%= if @settings_open do %>
+            <.settings_modal form={@settings_form} model_options={@settings_models} />
+          <% end %>
+
+          <%= if @skill_import_open do %>
+            <div class="fixed inset-0 z-[555] flex items-center justify-center p-4">
+              <div class="absolute inset-0 bg-black/50" phx-click="close_skill_import"></div>
+              <div class="relative z-10 flex max-h-[min(80vh,32rem)] w-full max-w-lg flex-col rounded-2xl border border-zinc-200 bg-white shadow-xl [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:bg-zinc-900">
+                <div class="flex items-center justify-between border-b border-zinc-200 px-4 py-3 [[data-theme=dark]_&]:border-zinc-800">
+                  <span class="text-sm font-semibold">从 skills 目录导入</span>
                   <button
                     type="button"
-                    phx-click="close_skill_editor"
+                    phx-click="close_skill_import"
+                    class="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                    aria-label="关闭"
+                  >
+                    <.icon name="hero-x-mark" class="size-5" />
+                  </button>
+                </div>
+                <div class="flex-1 min-h-0 overflow-y-auto p-2">
+                  <%= if @skill_import_files == [] do %>
+                    <p class="text-sm text-zinc-500 px-2 py-4 text-center">
+                      未找到 .md 文件。请在设置中配置内部 / 外部 skills 目录。
+                    </p>
+                  <% else %>
+                    <%= for f <- @skill_import_files do %>
+                      <button
+                        type="button"
+                        phx-click="import_skill_pick"
+                        phx-value-path={f.path}
+                        class="block w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800 truncate"
+                        title={f.path}
+                      >
+                        {f.name}
+                      </button>
+                    <% end %>
+                  <% end %>
+                </div>
+              </div>
+            </div>
+          <% end %>
+
+          <%= if @external_link_prompt do %>
+            <div class="fixed inset-0 z-[75] flex items-center justify-center p-4">
+              <div class="absolute inset-0 bg-black/50" phx-click="cancel_external_link"></div>
+              <div class="relative z-10 w-full max-w-md rounded-2xl border border-zinc-200 bg-white p-5 shadow-xl [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:bg-zinc-900">
+                <p class="text-sm font-medium text-zinc-800 [[data-theme=dark]_&]:text-zinc-100">
+                  在浏览器新标签页中打开外部链接？
+                </p>
+                <p class="mt-2 text-xs text-zinc-500 break-all">
+                  {@external_link_prompt.url}
+                </p>
+                <%= if (Map.get(@external_link_prompt, :title) || "") != "" do %>
+                  <p class="mt-1 text-sm text-zinc-600 [[data-theme=dark]_&]:text-zinc-300 truncate">
+                    {Map.get(@external_link_prompt, :title)}
+                  </p>
+                <% end %>
+                <div class="mt-4 flex gap-2 justify-end">
+                  <button
+                    type="button"
+                    phx-click="cancel_external_link"
                     class="rounded-lg border border-zinc-300 px-4 py-2 text-sm [[data-theme=dark]_&]:border-zinc-600"
                   >
                     取消
                   </button>
                   <button
-                    type="submit"
+                    type="button"
+                    phx-click="confirm_external_link"
                     class="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
                   >
-                    保存
+                    打开链接
                   </button>
                 </div>
-              </form>
-            </aside>
+              </div>
+            </div>
           <% end %>
 
-          <main class="relative flex flex-1 flex-col min-w-0 min-h-0 bg-white [[data-theme=dark]_&]:bg-zinc-950">
-            <header class="flex h-12 items-center gap-2 border-b border-zinc-200/80 px-3 shrink-0 [[data-theme=dark]_&]:border-zinc-800">
-              <button
-                type="button"
-                phx-click="toggle_sidebar"
-                class="rounded-lg p-2 text-zinc-600 hover:bg-zinc-100 lg:hidden [[data-theme=dark]_&]:text-zinc-300 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                aria-label="菜单"
-              >
-                <.icon name="hero-bars-3" class="size-5" />
-              </button>
-              <div class="flex-1 min-w-0">
-                <h1 class="text-[15px] font-semibold truncate">
-                  {(@session && @session.title) || (@project && @project.title) || "选择项目或对话"}
-                </h1>
-              </div>
-            </header>
-
-            <%= if @skill_proposal do %>
-              <div class="shrink-0 border-b border-amber-200/80 bg-amber-50 px-4 py-3 text-sm [[data-theme=dark]_&]:border-amber-900/50 [[data-theme=dark]_&]:bg-amber-950/40">
-                <p class="font-medium text-amber-900 [[data-theme=dark]_&]:text-amber-200">
-                  建议保存新技能（需确认）
-                </p>
-                <p class="text-zinc-700 mt-1 truncate [[data-theme=dark]_&]:text-zinc-300">
-                  {@skill_proposal.title}
-                </p>
-                <div class="mt-2 flex gap-2">
-                  <button
-                    type="button"
-                    phx-click="accept_skill_proposal"
-                    class="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
-                  >
-                    接受并保存
-                  </button>
-                  <button
-                    type="button"
-                    phx-click="dismiss_skill_proposal"
-                    class="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs [[data-theme=dark]_&]:border-zinc-600"
-                  >
-                    忽略
-                  </button>
-                </div>
-              </div>
-            <% end %>
-
-            <%= if @move_target do %>
-              <.move_project_modal
-                projects={@projects}
-                move_target={@move_target}
-                current_project={@project}
-              />
-            <% end %>
-
-            <%= if @editing do %>
-              <.edit_modal editing={@editing} projects={@projects} sessions={@sessions} />
-            <% end %>
-
-            <%= if @settings_open do %>
-              <.settings_modal form={@settings_form} model_options={@settings_models} />
-            <% end %>
-
-            <%= if @skill_import_open do %>
-              <div class="fixed inset-0 z-[555] flex items-center justify-center p-4">
-                <div class="absolute inset-0 bg-black/50" phx-click="close_skill_import"></div>
-                <div class="relative z-10 flex max-h-[min(80vh,32rem)] w-full max-w-lg flex-col rounded-2xl border border-zinc-200 bg-white shadow-xl [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:bg-zinc-900">
-                  <div class="flex items-center justify-between border-b border-zinc-200 px-4 py-3 [[data-theme=dark]_&]:border-zinc-800">
-                    <span class="text-sm font-semibold">从 skills 目录导入</span>
-                    <button
-                      type="button"
-                      phx-click="close_skill_import"
-                      class="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                      aria-label="关闭"
-                    >
-                      <.icon name="hero-x-mark" class="size-5" />
-                    </button>
-                  </div>
-                  <div class="flex-1 min-h-0 overflow-y-auto p-2">
-                    <%= if @skill_import_files == [] do %>
-                      <p class="text-sm text-zinc-500 px-2 py-4 text-center">
-                        未找到 .md 文件。请在设置中配置内部 / 外部 skills 目录。
-                      </p>
-                    <% else %>
-                      <%= for f <- @skill_import_files do %>
-                        <button
-                          type="button"
-                          phx-click="import_skill_pick"
-                          phx-value-path={f.path}
-                          class="block w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800 truncate"
-                          title={f.path}
-                        >
-                          {f.name}
-                        </button>
+          <%= if @session do %>
+            <div
+              id="chat-scroll"
+              phx-hook="ChatScroll"
+              class="flex-1 overflow-y-auto px-3 py-6 space-y-5 scroll-smooth mx-auto w-full max-w-[46.75rem]"
+              data-external-link-event="external_link_click"
+            >
+              <%= for slice <- chat_slices(@log, @user_edit_meta, @user_variant_idx) do %>
+                <%= case slice do %>
+                  <% {:plain, grouped} -> %>
+                    <%= for entry <- grouped do %>
+                      <%= case entry do %>
+                        <% {:tools, items} -> %>
+                          <.tools_flow_block items={items} />
+                        <% _ -> %>
+                          <.chat_bubble entry={entry} />
                       <% end %>
                     <% end %>
-                  </div>
-                </div>
-              </div>
-            <% end %>
-
-            <%= if @external_link_prompt do %>
-              <div class="fixed inset-0 z-[75] flex items-center justify-center p-4">
-                <div class="absolute inset-0 bg-black/50" phx-click="cancel_external_link"></div>
-                <div class="relative z-10 w-full max-w-md rounded-2xl border border-zinc-200 bg-white p-5 shadow-xl [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:bg-zinc-900">
-                  <p class="text-sm font-medium text-zinc-800 [[data-theme=dark]_&]:text-zinc-100">
-                    在浏览器新标签页中打开外部链接？
-                  </p>
-                  <p class="mt-2 text-xs text-zinc-500 break-all">
-                    {@external_link_prompt.url}
-                  </p>
-                  <%= if (Map.get(@external_link_prompt, :title) || "") != "" do %>
-                    <p class="mt-1 text-sm text-zinc-600 [[data-theme=dark]_&]:text-zinc-300 truncate">
-                      {Map.get(@external_link_prompt, :title)}
-                    </p>
-                  <% end %>
-                  <div class="mt-4 flex gap-2 justify-end">
-                    <button
-                      type="button"
-                      phx-click="cancel_external_link"
-                      class="rounded-lg border border-zinc-300 px-4 py-2 text-sm [[data-theme=dark]_&]:border-zinc-600"
-                    >
-                      取消
-                    </button>
-                    <button
-                      type="button"
-                      phx-click="confirm_external_link"
-                      class="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
-                    >
-                      打开链接
-                    </button>
-                  </div>
-                </div>
-              </div>
-            <% end %>
-
-            <%= if @session do %>
-              <%= if @checkpoints != [] do %>
-                <div class="shrink-0 border-b border-zinc-100 bg-zinc-50/80 px-3 py-2 text-xs max-h-20 overflow-y-auto [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900/50">
-                  <span class="font-medium text-zinc-500">检查点</span>
-                  <ul class="mt-1 space-y-0.5 text-zinc-600 [[data-theme=dark]_&]:text-zinc-400">
-                    <%= for c <- Enum.take(@checkpoints, 5) do %>
-                      <li class="truncate">
-                        {c.label || "checkpoint"} · {Calendar.strftime(c.inserted_at, "%H:%M")}
-                      </li>
-                    <% end %>
-                  </ul>
-                </div>
+                  <% {:user_turn, msg_id, display_text, versions, vidx, grouped_follow} -> %>
+                    <.user_message_block
+                      msg_id={msg_id || ""}
+                      content={display_text}
+                      versions={versions}
+                      variant_idx={vidx}
+                      editing_user={@editing_user_msg}
+                      follow_entries={grouped_follow}
+                    />
+                <% end %>
               <% end %>
 
-              <div
-                id="chat-scroll"
-                phx-hook="ChatScroll"
-                class="flex-1 overflow-y-auto px-3 py-6 space-y-5 scroll-smooth max-w-[56rem] mx-auto w-full"
-                data-external-link-event="external_link_click"
-              >
-                <%= for slice <- chat_slices(@log, @user_edit_meta, @user_variant_idx) do %>
-                  <%= case slice do %>
-                    <% {:plain, grouped} -> %>
-                      <%= for entry <- grouped do %>
-                        <%= case entry do %>
-                          <% {:tools, items} -> %>
-                            <.tools_flow_block items={items} />
-                          <% _ -> %>
-                            <.chat_bubble entry={entry} />
-                        <% end %>
-                      <% end %>
-                    <% {:user_turn, msg_id, display_text, versions, vidx, grouped_follow} -> %>
-                      <.user_message_block
-                        msg_id={msg_id || ""}
-                        content={display_text}
-                        versions={versions}
-                        variant_idx={vidx}
-                        editing_user={@editing_user_msg}
-                        follow_entries={grouped_follow}
-                      />
-                  <% end %>
-                <% end %>
-
-                <%= if @draft_reasoning && @draft_reasoning != "" do %>
-                  <details class="group rounded-xl border border-violet-200/80 bg-violet-50/90 [[data-theme=dark]_&]:border-violet-900/50 [[data-theme=dark]_&]:bg-violet-950/30">
-                    <summary class="cursor-pointer select-none list-none flex items-center gap-2 px-4 py-2.5 text-xs font-medium text-violet-700 [[data-theme=dark]_&]:text-violet-300 marker:content-none">
-                      <.icon
-                        name="hero-chevron-right"
-                        class="size-4 shrink-0 transition-transform group-open:rotate-90"
-                      />
-                      <.icon name="hero-sparkles" class="size-4" /> 思考中…（点击展开）
-                    </summary>
-                    <div class="chat-md border-t border-violet-200/60 px-4 py-3 text-sm text-zinc-800 [[data-theme=dark]_&]:border-violet-900/40 [[data-theme=dark]_&]:text-zinc-200">
-                      {raw(md_html(@draft_reasoning))}
-                    </div>
-                  </details>
-                <% end %>
-
-                <%= if @draft_assistant && @draft_assistant != "" do %>
-                  <div class="flex justify-start">
-                    <div class="chat-md w-full rounded-2xl border border-zinc-200 bg-zinc-50 px-4 py-3 [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900/60">
-                      <div class="flex items-center gap-2 text-xs text-zinc-500 mb-2">
-                        <span class="inline-block size-2 rounded-full bg-emerald-500 animate-pulse">
-                        </span>
-                        正在输出…
-                      </div>
-                      <div class="chat-md text-[15px] leading-relaxed">
-                        {raw(md_html(@draft_assistant))}
-                      </div>
-                    </div>
+              <%= if @draft_reasoning && @draft_reasoning != "" do %>
+                <details class="group rounded-xl border border-violet-200/80 bg-violet-50/90 [[data-theme=dark]_&]:border-violet-900/50 [[data-theme=dark]_&]:bg-violet-950/30">
+                  <summary class="cursor-pointer select-none list-none flex items-center gap-2 px-4 py-2.5 text-xs font-medium text-violet-700 [[data-theme=dark]_&]:text-violet-300 marker:content-none">
+                    <.icon
+                      name="hero-chevron-right"
+                      class="size-4 shrink-0 transition-transform group-open:rotate-90"
+                    />
+                    <.icon name="hero-sparkles" class="size-4" /> 思考中…（点击展开）
+                  </summary>
+                  <div class="chat-md border-t border-violet-200/60 px-4 py-3 text-sm text-zinc-800 [[data-theme=dark]_&]:border-violet-900/40 [[data-theme=dark]_&]:text-zinc-200">
+                    {raw(md_html(@draft_reasoning))}
                   </div>
-                <% end %>
-              </div>
-
-              <%= if @pending_ask do %>
-                <div class="shrink-0 border-t border-amber-300/50 bg-amber-50/90 px-4 py-3 [[data-theme=dark]_&]:border-amber-900/40 [[data-theme=dark]_&]:bg-amber-950/30">
-                  <p class="text-sm font-medium">需要你的确认</p>
-                  <p class="text-sm mt-1 whitespace-pre-wrap text-zinc-700 [[data-theme=dark]_&]:text-zinc-300">
-                    {@pending_ask.question}
-                  </p>
-                  <form
-                    id="ask-user-form"
-                    phx-submit="answer_user"
-                    class="mt-3 flex flex-col sm:flex-row gap-2"
-                  >
-                    <input type="hidden" name="ref" value={@pending_ask.ref} />
-                    <textarea
-                      name="text"
-                      id="ask-user-text"
-                      rows="2"
-                      class="flex-1 rounded-xl border border-zinc-300 bg-white px-3 py-2 text-sm min-h-[2.5rem] [[data-theme=dark]_&]:border-zinc-600 [[data-theme=dark]_&]:bg-zinc-900"
-                      placeholder="输入回复…"
-                    ></textarea>
-                    <button
-                      type="submit"
-                      class="rounded-xl bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700 shrink-0"
-                    >
-                      提交
-                    </button>
-                  </form>
-                </div>
+                </details>
               <% end %>
 
-              <div class="shrink-0 border-t border-zinc-200/80 p-3 bg-white [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-950">
+              <%= if @draft_assistant && @draft_assistant != "" do %>
+                <div class="flex justify-start">
+                  <div class="chat-md w-full rounded-2xl border border-zinc-200 bg-zinc-50 px-4 py-3 [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900/60">
+                    <div class="flex items-center gap-2 text-xs text-zinc-500 mb-2">
+                      <span class="inline-block size-2 rounded-full bg-emerald-500 animate-pulse">
+                      </span>
+                      正在输出…
+                    </div>
+                    <div class="chat-md text-[15px] leading-relaxed">
+                      {raw(md_html(@draft_assistant))}
+                    </div>
+                  </div>
+                </div>
+              <% end %>
+            </div>
+
+            <%= if @pending_ask do %>
+              <div class="shrink-0 border-t border-amber-300/50 bg-amber-50/90 px-4 py-3 [[data-theme=dark]_&]:border-amber-900/40 [[data-theme=dark]_&]:bg-amber-950/30">
+                <p class="text-sm font-medium">需要你的确认</p>
+                <p class="text-sm mt-1 whitespace-pre-wrap text-zinc-700 [[data-theme=dark]_&]:text-zinc-300">
+                  {@pending_ask.question}
+                </p>
                 <form
-                  id="chat-send-form"
-                  phx-submit="send"
-                  class="mx-auto flex max-w-[56rem] gap-2 items-end w-full"
+                  id="ask-user-form"
+                  phx-submit="answer_user"
+                  class="mt-3 flex flex-col sm:flex-row gap-2"
                 >
-                  <div class="flex-1 relative">
-                    <textarea
-                      id="chat-composer"
-                      name="text"
-                      rows="1"
-                      phx-hook="ChatComposer"
-                      class="w-full min-h-[2.75rem] max-h-[12rem] resize-none rounded-2xl border border-zinc-300 bg-zinc-50 px-4 py-3 pr-12 text-[15px] leading-relaxed [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:bg-zinc-900"
-                      placeholder="按 Enter 发送，Shift+Enter 换行"
-                      autocomplete="off"
-                    ></textarea>
-                  </div>
-                  <%= if @agent_busy do %>
-                    <button
-                      type="button"
-                      phx-click="stop_agent"
-                      id="chat-stop-btn"
-                      class="rounded-2xl bg-red-600 p-3 text-white shadow-sm hover:bg-red-700 transition-colors shrink-0"
-                      title="停止生成"
-                      aria-label="停止生成"
-                    >
-                      <.icon name="hero-stop-circle-solid" class="size-5" />
-                    </button>
-                  <% else %>
-                    <button
-                      type="submit"
-                      id="chat-send-btn"
-                      class="rounded-2xl bg-emerald-600 p-3 text-white shadow-sm hover:bg-emerald-700 transition-colors shrink-0"
-                      title="发送"
-                      aria-label="发送"
-                    >
-                      <.icon name="hero-paper-airplane-solid" class="size-5" />
-                    </button>
-                  <% end %>
+                  <input type="hidden" name="ref" value={@pending_ask.ref} />
+                  <textarea
+                    name="text"
+                    id="ask-user-text"
+                    rows="2"
+                    class="flex-1 rounded-xl border border-zinc-300 bg-white px-3 py-2 text-sm min-h-[2.5rem] [[data-theme=dark]_&]:border-zinc-600 [[data-theme=dark]_&]:bg-zinc-900"
+                    placeholder="输入回复…"
+                  ></textarea>
+                  <button
+                    type="submit"
+                    class="rounded-xl bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700 shrink-0"
+                  >
+                    提交
+                  </button>
                 </form>
               </div>
-            <% else %>
-              <%= if @project do %>
-                <div class="flex flex-1 flex-col min-h-0 justify-end">
-                  <div class="shrink-0 px-4 pt-6 pb-2 text-center">
-                    <p class="text-sm text-zinc-600 [[data-theme=dark]_&]:text-zinc-400 max-w-lg mx-auto">
-                      在下方输入首条消息将自动创建对话，标题由首句生成。侧栏可管理技能与 Memory 文档。
-                    </p>
-                  </div>
-                  <div class="shrink-0 border-t border-zinc-200/80 p-3 bg-white [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-950">
-                    <form
-                      id="chat-send-form-project"
-                      phx-submit="send"
-                      class="mx-auto flex max-w-[56rem] gap-2 items-end w-full"
-                    >
-                      <div class="flex-1 relative">
-                        <textarea
-                          id="chat-composer-project"
-                          name="text"
-                          rows="1"
-                          phx-hook="ChatComposer"
-                          class="w-full min-h-[2.75rem] max-h-[12rem] resize-none rounded-2xl border border-zinc-300 bg-zinc-50 px-4 py-3 pr-12 text-[15px] leading-relaxed [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:bg-zinc-900"
-                          placeholder="按 Enter 发送首条消息，Shift+Enter 换行"
-                          autocomplete="off"
-                        ></textarea>
-                      </div>
-                      <%= if @agent_busy do %>
-                        <button
-                          type="button"
-                          phx-click="stop_agent"
-                          id="chat-stop-btn-project"
-                          class="rounded-2xl bg-red-600 p-3 text-white shadow-sm hover:bg-red-700 transition-colors shrink-0"
-                          title="停止生成"
-                          aria-label="停止生成"
-                        >
-                          <.icon name="hero-stop-circle-solid" class="size-5" />
-                        </button>
-                      <% else %>
-                        <button
-                          type="submit"
-                          id="chat-send-btn-project"
-                          class="rounded-2xl bg-emerald-600 p-3 text-white shadow-sm hover:bg-emerald-700 transition-colors shrink-0"
-                          title="发送"
-                          aria-label="发送"
-                        >
-                          <.icon name="hero-paper-airplane-solid" class="size-5" />
-                        </button>
-                      <% end %>
-                    </form>
-                  </div>
-                </div>
-              <% else %>
-                <div class="flex flex-1 flex-col items-center justify-center p-8 text-center text-zinc-500">
-                  <p class="text-lg font-medium text-zinc-700 [[data-theme=dark]_&]:text-zinc-300 mb-2">
-                    选择项目
-                  </p>
-                  <p class="text-sm max-w-md">
-                    请先在侧栏选择或新建项目。
-                  </p>
-                </div>
-              <% end %>
             <% end %>
-          </main>
+
+            <%= if @pending_diff do %>
+              <.diff_review_block pending_diff={@pending_diff} />
+            <% end %>
+
+            <div class="shrink-0 border-t border-zinc-200/80 p-3 bg-white [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-950">
+              <form
+                id="chat-send-form"
+                phx-submit="send"
+                class="mx-auto flex max-w-[46.75rem] gap-2 items-end w-full"
+              >
+                <div class="flex-1 relative">
+                  <textarea
+                    id="chat-composer"
+                    name="text"
+                    rows="1"
+                    phx-hook="ChatComposer"
+                    class="w-full min-h-[2.75rem] max-h-[12rem] resize-none rounded-2xl border border-zinc-300 bg-zinc-50 px-4 py-3 pr-12 text-[15px] leading-relaxed [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:bg-zinc-900"
+                    placeholder="按 Enter 发送，Shift+Enter 换行"
+                    autocomplete="off"
+                  ></textarea>
+                </div>
+                <%= if @agent_busy do %>
+                  <button
+                    type="button"
+                    phx-click="stop_agent"
+                    id="chat-stop-btn"
+                    class="rounded-2xl bg-red-600 p-3 text-white shadow-sm hover:bg-red-700 transition-colors shrink-0"
+                    title="停止生成"
+                    aria-label="停止生成"
+                  >
+                    <.icon name="hero-stop-circle-solid" class="size-5" />
+                  </button>
+                <% else %>
+                  <button
+                    type="submit"
+                    id="chat-send-btn"
+                    class="rounded-2xl bg-emerald-600 p-3 text-white shadow-sm hover:bg-emerald-700 transition-colors shrink-0"
+                    title="发送"
+                    aria-label="发送"
+                  >
+                    <.icon name="hero-paper-airplane-solid" class="size-5" />
+                  </button>
+                <% end %>
+              </form>
+            </div>
+          <% else %>
+            <%= if @project do %>
+              <div class="flex flex-1 flex-col min-h-0 justify-end">
+                <div class="shrink-0 px-4 pt-6 pb-2 text-center">
+                  <p class="text-sm text-zinc-600 [[data-theme=dark]_&]:text-zinc-400 max-w-lg mx-auto">
+                    在下方输入首条消息将自动创建对话，标题由首句生成。右侧面板可查看轨迹、记忆与插件。
+                  </p>
+                </div>
+                <div class="shrink-0 border-t border-zinc-200/80 p-3 bg-white [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-950">
+                  <form
+                    id="chat-send-form-project"
+                    phx-submit="send"
+                    class="mx-auto flex max-w-[46.75rem] gap-2 items-end w-full"
+                  >
+                    <div class="flex-1 relative">
+                      <textarea
+                        id="chat-composer-project"
+                        name="text"
+                        rows="1"
+                        phx-hook="ChatComposer"
+                        class="w-full min-h-[2.75rem] max-h-[12rem] resize-none rounded-2xl border border-zinc-300 bg-zinc-50 px-4 py-3 pr-12 text-[15px] leading-relaxed [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:bg-zinc-900"
+                        placeholder="按 Enter 发送首条消息，Shift+Enter 换行"
+                        autocomplete="off"
+                      ></textarea>
+                    </div>
+                    <%= if @agent_busy do %>
+                      <button
+                        type="button"
+                        phx-click="stop_agent"
+                        id="chat-stop-btn-project"
+                        class="rounded-2xl bg-red-600 p-3 text-white shadow-sm hover:bg-red-700 transition-colors shrink-0"
+                        title="停止生成"
+                        aria-label="停止生成"
+                      >
+                        <.icon name="hero-stop-circle-solid" class="size-5" />
+                      </button>
+                    <% else %>
+                      <button
+                        type="submit"
+                        id="chat-send-btn-project"
+                        class="rounded-2xl bg-emerald-600 p-3 text-white shadow-sm hover:bg-emerald-700 transition-colors shrink-0"
+                        title="发送"
+                        aria-label="发送"
+                      >
+                        <.icon name="hero-paper-airplane-solid" class="size-5" />
+                      </button>
+                    <% end %>
+                  </form>
+                </div>
+              </div>
+            <% else %>
+              <div class="flex flex-1 flex-col items-center justify-center p-8 text-center text-zinc-500">
+                <p class="text-lg font-medium text-zinc-700 [[data-theme=dark]_&]:text-zinc-300 mb-2">
+                  选择项目
+                </p>
+                <p class="text-sm max-w-md">
+                  请先在侧栏选择或新建项目。
+                </p>
+              </div>
+            <% end %>
+          <% end %>
+        </main>
+
+        <div
+          :if={@right_open}
+          class="fixed inset-0 z-40 bg-black/40 xl:hidden"
+          phx-click="toggle_right"
+        >
         </div>
+
+        <aside
+          id="sidebar-right"
+          class={[
+            "flex-col border-l border-zinc-200/80 bg-white [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900",
+            "max-xl:fixed max-xl:inset-y-0 max-xl:right-0 max-xl:z-50 max-xl:w-[min(24rem,92vw)] max-xl:shadow-2xl",
+            "xl:relative xl:flex xl:w-[24rem] xl:shrink-0",
+            if(@right_open, do: "flex translate-x-0", else: "max-xl:hidden xl:hidden")
+          ]}
+        >
+          <div class="flex h-12 items-center gap-2 border-b border-zinc-200/80 px-3 shrink-0 [[data-theme=dark]_&]:border-zinc-800">
+            <span class="text-xs font-semibold uppercase tracking-wider text-zinc-500">
+              {right_tab_title(@right_tab)}
+            </span>
+            <button
+              type="button"
+              phx-click="toggle_right"
+              class="ml-auto rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+              aria-label="关闭面板"
+            >
+              <.icon name="hero-x-mark" class="size-4" />
+            </button>
+          </div>
+
+          <div class="flex-1 min-h-0 overflow-y-auto p-3">
+            <%= case @right_tab do %>
+              <% :plugins -> %>
+                <.plugin_panel plugins_info={@plugins_info} />
+              <% :memory -> %>
+                <.memory_panel
+                  skills={@skills_sidebar}
+                  memory_doc_files={@memory_doc_files}
+                  checkpoints={@checkpoints}
+                />
+              <% _ -> %>
+                <.timeline_panel
+                  agent_busy={@agent_busy}
+                  checkpoints={@checkpoints}
+                  log={@log}
+                  pending_ask={@pending_ask}
+                  pending_diff={@pending_diff}
+                />
+            <% end %>
+          </div>
+        </aside>
       </div>
     </Layouts.app>
+    """
+  end
+
+  defp right_tab_title(:plugins), do: "插件管理"
+  defp right_tab_title(:memory), do: "记忆与技能"
+  defp right_tab_title(:timeline), do: "运行轨迹"
+
+  attr :pending_diff, :map, required: true
+
+  defp diff_review_block(assigns) do
+    assigns = assign(assigns, :diff_lines, diff_lines(assigns.pending_diff["diff"]))
+
+    ~H"""
+    <div class="shrink-0 border-t border-indigo-300/50 bg-indigo-50/60 px-3 py-3 [[data-theme=dark]_&]:border-indigo-900/40 [[data-theme=dark]_&]:bg-indigo-950/25">
+      <div class="mx-auto w-full max-w-[46.75rem]">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="flex items-center gap-1.5 text-sm font-medium text-indigo-900 [[data-theme=dark]_&]:text-indigo-200">
+            <.icon name="hero-code-bracket" class="size-4" /> 代码修改待确认
+          </span>
+          <span class="rounded-md bg-white/70 px-2 py-0.5 font-mono text-[11px] text-zinc-600 [[data-theme=dark]_&]:bg-zinc-900/60 [[data-theme=dark]_&]:text-zinc-300">
+            {@pending_diff["path"]}
+          </span>
+          <span class="text-[11px] text-zinc-500">
+            来源工具 {@pending_diff["tool"]}
+          </span>
+          <div class="ml-auto flex gap-2">
+            <button
+              type="button"
+              phx-click="review_diff"
+              phx-value-ref={@pending_diff["ref"]}
+              phx-value-decision="keep"
+              id="diff-review-keep"
+              class="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
+            >
+              保留修改
+            </button>
+            <button
+              type="button"
+              phx-click="review_diff"
+              phx-value-ref={@pending_diff["ref"]}
+              phx-value-decision="reject"
+              id="diff-review-reject"
+              class="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs [[data-theme=dark]_&]:border-zinc-600"
+            >
+              拒绝
+            </button>
+          </div>
+        </div>
+        <div class="dsh-diff mt-2 max-h-64 overflow-y-auto rounded-lg border border-indigo-200/70 bg-white font-mono text-[11px] leading-5 [[data-theme=dark]_&]:border-indigo-900/40 [[data-theme=dark]_&]:bg-zinc-900/70">
+          <%= for {tag, line} <- @diff_lines do %>
+            <pre class={[
+              "m-0 whitespace-pre-wrap px-3 py-px",
+              tag == :add && "dsh-diff-add",
+              tag == :del && "dsh-diff-del",
+              tag == :meta && "dsh-diff-meta",
+              tag == :ctx && "text-zinc-600 [[data-theme=dark]_&]:text-zinc-400"
+            ]}>{line}</pre>
+          <% end %>
+        </div>
+        <p class="mt-1.5 text-[11px] text-zinc-500">
+          选择「保留修改」后文件才会写入；拒绝则不产生任何变更，Agent 会继续处理。
+        </p>
+      </div>
+    </div>
+    """
+  end
+
+  attr :plugins_info, :map, required: true
+
+  defp plugin_panel(assigns) do
+    assigns = assign(assigns, :info, assigns.plugins_info || %{})
+
+    ~H"""
+    <div id="plugin-panel" class="space-y-3">
+      <div class="rounded-xl border border-zinc-200 p-3 [[data-theme=dark]_&]:border-zinc-800">
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-sm font-semibold">Cordis 运行时</span>
+          <span class={[
+            "rounded-full px-2 py-0.5 text-[11px] font-medium",
+            @info[:runtime_ready] == true &&
+              "bg-emerald-100 text-emerald-700 [[data-theme=dark]_&]:bg-emerald-900/40 [[data-theme=dark]_&]:text-emerald-300",
+            @info[:runtime_ready] != true &&
+              "bg-zinc-100 text-zinc-500 [[data-theme=dark]_&]:bg-zinc-800 [[data-theme=dark]_&]:text-zinc-400"
+          ]}>
+            {if(@info[:runtime_ready] == true, do: "运行中", else: "未运行")}
+          </span>
+        </div>
+        <p class="mt-2 text-[11px] text-zinc-500 break-all">
+          配置：{@info[:config_path]}
+        </p>
+        <div class="mt-1 text-[11px] text-zinc-500">
+          插件 {length(@info[:plugins] || [])} ·
+          工具 {length(@info[:tools] || [])} ·
+          提示段 {length(@info[:prompt_sections] || [])}
+        </div>
+        <button
+          type="button"
+          phx-click="refresh_plugins"
+          class="mt-2 rounded-lg border border-zinc-300 px-2.5 py-1 text-xs hover:bg-zinc-100 [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:hover:bg-zinc-800"
+        >
+          刷新状态
+        </button>
+      </div>
+
+      <%= if @info[:config_found] != true do %>
+        <div class="rounded-xl border border-dashed border-zinc-300 p-3 text-xs text-zinc-500 [[data-theme=dark]_&]:border-zinc-700">
+          未找到 cordis 配置。复制 <code class="font-mono">.fluxclaw/cordis.example.yml</code>
+          为 <code class="font-mono">.fluxclaw/cordis.yml</code>
+          即可启用 DeepSeek Harness 插件（npm 或本地 .mjs）。
+        </div>
+      <% end %>
+
+      <%= for p <- @info[:plugins] || [] do %>
+        <div class="rounded-xl border border-zinc-200 p-3 [[data-theme=dark]_&]:border-zinc-800">
+          <div class="flex items-center gap-2">
+            <span class="min-w-0 flex-1 truncate text-sm font-medium">{p.name || p.id}</span>
+            <span class={[
+              "shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium",
+              p.loaded &&
+                "bg-emerald-100 text-emerald-700 [[data-theme=dark]_&]:bg-emerald-900/40 [[data-theme=dark]_&]:text-emerald-300",
+              !p.loaded &&
+                "bg-zinc-100 text-zinc-500 [[data-theme=dark]_&]:bg-zinc-800 [[data-theme=dark]_&]:text-zinc-400"
+            ]}>
+              {if(p.loaded, do: "已加载", else: "未加载")}
+            </span>
+          </div>
+          <div class="mt-1 flex items-center gap-2 text-[11px] text-zinc-500">
+            <span class="rounded bg-zinc-100 px-1.5 py-0.5 font-mono [[data-theme=dark]_&]:bg-zinc-800">
+              {if(p.source_kind == :local, do: "local", else: "npm")}
+            </span>
+            <span class="truncate">{p.id}</span>
+            <span class="shrink-0">{length(p.tools)} 工具</span>
+          </div>
+        </div>
+      <% end %>
+
+      <%= if (@info[:tools] || []) != [] do %>
+        <div class="rounded-xl border border-zinc-200 p-3 [[data-theme=dark]_&]:border-zinc-800">
+          <p class="text-sm font-semibold mb-2">插件工具</p>
+          <ul class="space-y-2">
+            <%= for t <- @info[:tools] || [] do %>
+              <li class="text-xs">
+                <span class="font-mono text-emerald-600 [[data-theme=dark]_&]:text-emerald-400">
+                  {t.function.name}
+                </span>
+                <span class="block text-zinc-500 line-clamp-2">
+                  {t.function.description}
+                </span>
+              </li>
+            <% end %>
+          </ul>
+        </div>
+      <% end %>
+
+      <%= if (@info[:prompt_sections] || []) != [] do %>
+        <div class="rounded-xl border border-zinc-200 p-3 [[data-theme=dark]_&]:border-zinc-800">
+          <p class="text-sm font-semibold mb-2">注册的提示段</p>
+          <ul class="space-y-1 text-xs text-zinc-600 [[data-theme=dark]_&]:text-zinc-400">
+            <%= for s <- @info[:prompt_sections] || [] do %>
+              <li class="truncate">
+                <span class="font-medium">{s.title}</span>
+                <span class="text-zinc-400">· 优先级 {s.priority}</span>
+              </li>
+            <% end %>
+          </ul>
+        </div>
+      <% end %>
+    </div>
+    """
+  end
+
+  attr :skills, :list, required: true
+  attr :memory_doc_files, :list, required: true
+  attr :checkpoints, :list, required: true
+
+  defp memory_panel(assigns) do
+    ~H"""
+    <div class="space-y-4">
+      <section>
+        <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">检查点 (L1/L2)</p>
+        <%= if @checkpoints == [] do %>
+          <p class="mt-1 text-xs text-zinc-400">暂无工作检查点</p>
+        <% else %>
+          <ul class="mt-1 space-y-1">
+            <%= for c <- Enum.take(@checkpoints, 8) do %>
+              <li class="truncate rounded-lg px-2 py-1 text-xs text-zinc-600 hover:bg-zinc-100 [[data-theme=dark]_&]:text-zinc-400 [[data-theme=dark]_&]:hover:bg-zinc-800">
+                <span class="font-medium">{c.label || "checkpoint"}</span>
+                <span class="text-zinc-400">· {Calendar.strftime(c.inserted_at, "%m-%d %H:%M")}</span>
+              </li>
+            <% end %>
+          </ul>
+        <% end %>
+      </section>
+
+      <section>
+        <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">技能 (L3)</p>
+        <%= if @skills == [] do %>
+          <p class="mt-1 text-xs text-zinc-400">暂无技能，工具回合结束后会尝试结晶</p>
+        <% else %>
+          <ul class="mt-1 space-y-0.5">
+            <%= for sk <- @skills do %>
+              <li class="group flex items-center gap-1 rounded-lg px-2 py-1 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800">
+                <span class="min-w-0 flex-1 truncate text-xs" title={sk.title}>{sk.title}</span>
+                <button
+                  type="button"
+                  id={"right-panel-skill-#{sk.id}"}
+                  phx-hook="SidebarContextMenu"
+                  data-menu-type="skill"
+                  data-menu-id={sk.id}
+                  class="p-1 rounded text-zinc-400 hover:bg-zinc-200 [[data-theme=dark]_&]:hover:bg-zinc-700 shrink-0"
+                  aria-label="技能菜单"
+                >
+                  <.icon name="hero-ellipsis-vertical" class="size-3.5" />
+                </button>
+              </li>
+            <% end %>
+          </ul>
+        <% end %>
+      </section>
+
+      <section>
+        <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Memory 文档</p>
+        <%= if @memory_doc_files == [] do %>
+          <p class="mt-1 text-xs text-zinc-400">memory 目录下暂无文档</p>
+        <% else %>
+          <ul class="mt-1 space-y-0.5">
+            <%= for f <- @memory_doc_files do %>
+              <li
+                class="truncate rounded-lg px-2 py-1 text-xs text-zinc-500 [[data-theme=dark]_&]:text-zinc-400"
+                title={f.path}
+              >
+                {f.name}
+              </li>
+            <% end %>
+          </ul>
+        <% end %>
+        <p class="mt-2 text-[11px] text-zinc-400 leading-relaxed">
+          自进化摘要写入 <code class="font-mono">evolution_episodes.md</code>；确认模式下提案会出现在聊天顶部。
+        </p>
+      </section>
+    </div>
+    """
+  end
+
+  attr :agent_busy, :boolean, required: true
+  attr :checkpoints, :list, required: true
+  attr :log, :list, required: true
+  attr :pending_ask, :any, required: true
+  attr :pending_diff, :any, required: true
+
+  defp timeline_panel(assigns) do
+    tool_stats =
+      assigns.log
+      |> Enum.filter(&match?({:tool_done, _, _, _}, &1))
+      |> Enum.map(fn {_, name, _, _} -> name end)
+      |> Enum.frequencies()
+
+    assigns = assign(assigns, :tool_stats, tool_stats)
+
+    ~H"""
+    <div class="space-y-4">
+      <section class="rounded-xl border border-zinc-200 p-3 [[data-theme=dark]_&]:border-zinc-800">
+        <div class="flex items-center gap-2 text-sm font-semibold">
+          <span class={[
+            "inline-block size-2 rounded-full",
+            @agent_busy && "bg-emerald-500 animate-pulse",
+            !@agent_busy && "bg-zinc-300 [[data-theme=dark]_&]:bg-zinc-700"
+          ]}>
+          </span>
+          Agent {if(@agent_busy, do: "运行中", else: "空闲")}
+        </div>
+        <p class="mt-1 text-[11px] text-zinc-500">
+          工具调用 {Enum.sum(Map.values(@tool_stats))} 次 · 检查点 {length(@checkpoints)} 个
+        </p>
+      </section>
+
+      <%= if @pending_ask do %>
+        <div class="rounded-xl border border-amber-300/60 bg-amber-50 p-3 text-xs [[data-theme=dark]_&]:border-amber-900/40 [[data-theme=dark]_&]:bg-amber-950/25">
+          <p class="font-medium text-amber-900 [[data-theme=dark]_&]:text-amber-200">
+            等待你的回答
+          </p>
+          <p class="mt-1 text-zinc-600 line-clamp-3 [[data-theme=dark]_&]:text-zinc-400">
+            {@pending_ask.question}
+          </p>
+        </div>
+      <% end %>
+
+      <%= if @pending_diff do %>
+        <div class="rounded-xl border border-indigo-300/60 bg-indigo-50 p-3 text-xs [[data-theme=dark]_&]:border-indigo-900/40 [[data-theme=dark]_&]:bg-indigo-950/25">
+          <p class="font-medium text-indigo-900 [[data-theme=dark]_&]:text-indigo-200">
+            代码修改待确认：{@pending_diff["path"]}
+          </p>
+          <p class="mt-1 text-zinc-600 [[data-theme=dark]_&]:text-zinc-400">
+            在聊天底部选择保留或拒绝。
+          </p>
+        </div>
+      <% end %>
+
+      <%= if @tool_stats != %{} do %>
+        <section>
+          <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">工具使用</p>
+          <ul class="mt-1 space-y-1">
+            <%= for {name, count} <- Enum.sort_by(@tool_stats, fn {_, c} -> -c end) do %>
+              <li class="flex items-center justify-between rounded-lg px-2 py-1 text-xs text-zinc-600 hover:bg-zinc-100 [[data-theme=dark]_&]:text-zinc-400 [[data-theme=dark]_&]:hover:bg-zinc-800">
+                <span class="font-mono">{name}</span>
+                <span class="rounded-full bg-zinc-100 px-2 text-[10px] text-zinc-500 [[data-theme=dark]_&]:bg-zinc-800">
+                  {count}
+                </span>
+              </li>
+            <% end %>
+          </ul>
+        </section>
+      <% end %>
+
+      <%= if @checkpoints != [] do %>
+        <section>
+          <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">最近检查点</p>
+          <ul class="mt-1 space-y-1">
+            <%= for c <- Enum.take(@checkpoints, 5) do %>
+              <li class="truncate rounded-lg px-2 py-1 text-xs text-zinc-600 [[data-theme=dark]_&]:text-zinc-400">
+                {c.label || "checkpoint"} · {Calendar.strftime(c.inserted_at, "%H:%M")}
+              </li>
+            <% end %>
+          </ul>
+        </section>
+      <% end %>
+    </div>
     """
   end
 

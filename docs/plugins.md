@@ -52,6 +52,15 @@ The bridge provides the following Cordis services:
 
 Tools are injected into the same OpenAI-compatible tool list used by built-in tools. Their `execute()` function runs in the plugin's Node process, `output.render()` produces the model-facing text, and `exec.agent.session.append()` events are returned to Elixir for logging.
 
+## Plugin manager UI
+
+The right-hand sidebar of the chat UI has a 插件管理 tab backed by `FluxClaw.Plugins.summary/0`:
+
+- Runtime badge (running / not running) plus the resolved config path (`FLUXCLAW_CORDIS_CONFIG` / `DSH_CORDIS_CONFIG` / `.fluxclaw/cordis.yml`).
+- Each configured plugin with its source kind (`npm` vs `local`), load state, and contributed tool count.
+- The full list of plugin-registered OpenAI tool schemas and system-prompt sections.
+- 刷新状态 re-queries the runtime; the LiveView also subscribes to the `flux_claw:plugins` topic and refreshes on `{:plugin_loaded, ...}` / `{:plugin_tool_registered, ...}` / `{:plugin_tool_unregistered, ...}` broadcasts.
+
 ## Safety
 
 Plugin code runs outside the BEAM sandbox and has Node.js capabilities. Only install plugins from trusted sources. DeepSeek plugins that depend on host seams FluxClaw does not provide will remain pending or fail at load, rather than being silently stubbed.

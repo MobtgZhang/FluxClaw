@@ -232,3 +232,46 @@
 [data-theme="dark"] .chat-md tbody tr:nth-child(even) {
   background-color: color-mix(in oklab, var(--color-base-300) 14%, transparent);
 }
+
+/* Diff review block (Codex / Claude Code style keep/reject proposals) */
+
+.dsh-diff {
+  tab-size: 4;
+}
+
+.dsh-diff pre {
+  font-family: inherit;
+}
+
+.dsh-diff-add {
+  color: #15803d;
+  background-color: color-mix(in oklab, #22c55e 14%, transparent);
+}
+
+.dsh-diff-del {
+  color: #b91c1c;
+  background-color: color-mix(in oklab, #ef4444 14%, transparent);
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in oklab, #ef4444 45%, transparent);
+}
+
+.dsh-diff-meta {
+  color: #6d28d9;
+  background-color: color-mix(in oklab, #8b5cf6 10%, transparent);
+  user-select: none;
+}
+
+[data-theme="dark"] .dsh-diff-add {
+  color: #86efac;
+  background-color: color-mix(in oklab, #22c55e 18%, transparent);
+}
+
+[data-theme="dark"] .dsh-diff-del {
+  color: #fca5a5;
+  background-color: color-mix(in oklab, #ef4444 18%, transparent);
+}
+
+[data-theme="dark"] .dsh-diff-meta {
+  color: #c4b5fd;
+  background-color: color-mix(in oklab, #8b5cf6 14%, transparent);
+}

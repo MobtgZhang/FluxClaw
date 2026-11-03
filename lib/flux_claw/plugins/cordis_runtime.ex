@@ -56,6 +56,23 @@ defmodule FluxClaw.Plugins.CordisRuntime do
     end
   end
 
+  @doc """
+  Snapshot of the plugin runtime for the plugin-manager UI:
+  readiness, loaded plugins, contributed tools (grouped by plugin) and
+  prompt sections.
+  """
+  def status do
+    if process_alive?(@registry) do
+      try do
+        GenServer.call(@registry, :status, @call_timeout)
+      catch
+        :exit, _ -> {:error, :plugin_runtime_unavailable}
+      end
+    else
+      {:error, :plugin_runtime_unavailable}
+    end
+  end
+
   @impl true
   def init(opts) do
     config_path = Keyword.get(opts, :config_path) || default_config_path()
@@ -84,6 +101,8 @@ defmodule FluxClaw.Plugins.CordisRuntime do
       config_path: Path.expand(config_path),
       script_path: Path.expand(script_path),
       tools: [],
+      tools_by_plugin: %{},
+      plugins: [],
       prompt_sections: [],
       buffer: "",
       pending: %{},
@@ -100,6 +119,20 @@ defmodule FluxClaw.Plugins.CordisRuntime do
   def handle_call(:list_tools, _from, state), do: {:reply, state.tools, state}
 
   def handle_call(:prompt_sections, _from, state), do: {:reply, state.prompt_sections, state}
+
+  def handle_call(:status, _from, state) do
+    {:reply,
+     %{
+       ready: state.ready,
+       running: state.port != nil,
+       config_path: state.config_path,
+       script_path: state.script_path,
+       tools: state.tools,
+       tools_by_plugin: state.tools_by_plugin,
+       plugins: state.plugins,
+       prompt_sections: state.prompt_sections
+     }, state}
+  end
 
   def handle_call({:call_tool, _name, _args, _ctx}, _from, %{port: nil} = state) do
     {:reply, {:error, :plugin_runtime_unavailable}, state}
@@ -148,10 +181,34 @@ defmodule FluxClaw.Plugins.CordisRuntime do
       {:ok, %{"type" => "tool_registered", "tool" => tool} = msg} ->
         tool = atomize_tool(tool)
         state = put_unless_present(state, :tools, tool)
-        broadcast({:plugin_tool_registered, Map.get(msg, "pluginId"), tool.function.name})
+        plugin_id = Map.get(msg, "pluginId")
+
+        state =
+          if plugin_id do
+            %{
+              state
+              | tools_by_plugin:
+                  Map.update(state.tools_by_plugin, plugin_id, [tool.function.name], fn names ->
+                    Enum.uniq([tool.function.name | names])
+                  end)
+            }
+          else
+            state
+          end
+
+        broadcast({:plugin_tool_registered, plugin_id, tool.function.name})
         state
 
       {:ok, %{"type" => "tool_unregistered", "name" => name}} ->
+        state = %{
+          state
+          | tools_by_plugin:
+              state.tools_by_plugin
+              |> Enum.map(fn {pid, names} -> {pid, Enum.reject(names, &(&1 == name))} end)
+              |> Enum.reject(fn {_pid, names} -> names == [] end)
+              |> Map.new()
+        }
+
         broadcast({:plugin_tool_unregistered, name})
         update_in(state.tools, &Enum.reject(&1, fn tool -> tool.function.name == name end))
 
@@ -166,6 +223,8 @@ defmodule FluxClaw.Plugins.CordisRuntime do
         )
 
       {:ok, %{"type" => "plugin_loaded", "id" => id}} ->
+        Logger.info("Cordis plugin loaded: #{id}")
+        state = update_in(state.plugins, &put_plugin_id(&1, id))
         broadcast({:plugin_loaded, id})
         state
 
@@ -204,6 +263,10 @@ defmodule FluxClaw.Plugins.CordisRuntime do
         Logger.warning("Could not decode plugin runtime message: #{inspect(error)}")
         state
     end
+  end
+
+  defp put_plugin_id(existing, id) do
+    if id && id not in existing, do: [id | existing], else: existing
   end
 
   defp put_unless_present(state, key, value) do

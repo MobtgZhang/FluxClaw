@@ -85,6 +85,7 @@ defmodule FluxClaw.MixProject do
       "assets.setup": [
         "tailwind.install --if-missing",
         "esbuild.install --if-missing",
+        "cmd --cd assets npm install",
         "plugins.setup"
       ],
       "assets.build": ["compile", "tailwind flux_claw", "esbuild flux_claw"],

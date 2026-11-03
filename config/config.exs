@@ -17,7 +17,8 @@ config :flux_claw, :agents,
   max_steps: 32,
   crystallize_skills: true,
   crystallize_mode: :auto,
-  self_evolve: true
+  self_evolve: true,
+  review_edits: true
 
 config :flux_claw, :cache_paths,
   cache_root: nil,

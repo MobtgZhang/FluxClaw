@@ -1,11 +1,16 @@
 defmodule FluxClaw.Tools.FilePatch do
   @behaviour FluxClaw.Tool
 
+  alias FluxClaw.Tools.{Review, Sandbox}
+
   @impl true
   def name, do: "file_patch"
 
   @impl true
-  def description, do: "Replace first occurrence of `find` with `replace` in a sandbox file."
+  def description do
+    "Replace the first occurrence of `find` with `replace` in a sandbox file. " <>
+      "When diff review is enabled the change is proposed to the user and only written after they keep it."
+  end
 
   @impl true
   def parameters do
@@ -21,18 +26,15 @@ defmodule FluxClaw.Tools.FilePatch do
   end
 
   @impl true
-  def run(%{"path" => rel, "find" => find, "replace" => replace}, ctx) do
-    case FluxClaw.Tools.Sandbox.resolve!(ctx.sandbox_root, rel) do
+  def run(%{"path" => rel, "find" => find, "replace" => replace}, ctx)
+      when is_binary(rel) and is_binary(find) and is_binary(replace) do
+    case Sandbox.resolve!(ctx.sandbox_root, rel) do
       {:ok, abs} ->
         case File.read(abs) do
           {:ok, data} ->
             if String.contains?(data, find) do
               new = String.replace(data, find, replace, global: false)
-
-              case File.write(abs, new) do
-                :ok -> {:ok, "patched"}
-                {:error, r} -> {:error, inspect(r)}
-              end
+              Review.propose_write(ctx, rel, abs, data, new, name())
             else
               {:error, "find string not found"}
             end

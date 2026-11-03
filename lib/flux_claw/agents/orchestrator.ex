@@ -34,4 +34,16 @@ defmodule FluxClaw.Agents.Orchestrator do
         :ok
     end
   end
+
+  @doc "Forwards the user's keep/reject decision for a proposed diff to the session worker."
+  def reply_diff_review(session_id, ref, decision) when is_integer(ref) do
+    case Registry.lookup(FluxClaw.Agents.Registry, session_id) do
+      [{pid, _}] ->
+        send(pid, {:diff_review_reply, ref, decision})
+        :ok
+
+      [] ->
+        :ok
+    end
+  end
 end

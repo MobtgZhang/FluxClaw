@@ -263,6 +263,55 @@ defmodule FluxClaw.Memory do
     end
   end
 
+  @doc """
+  自进化（harness2 风格）：把会话内的一个工作检查点（L1/working memory）结晶为
+  持久技能（L3）。默认取最近的检查点；传 `:label` 可指定。
+  """
+  def promote_checkpoint_to_skill(session_id, opts \\ []) when is_binary(session_id) do
+    label = Keyword.get(opts, :label)
+
+    checkpoint =
+      session_id
+      |> list_checkpoints_for_session(50)
+      |> then(fn cps ->
+        if label, do: Enum.find(cps, &(&1.label == label)), else: List.first(cps)
+      end)
+
+    case checkpoint do
+      nil ->
+        {:error, :no_checkpoint}
+
+      cp ->
+        payload_note =
+          case cp.payload do
+            %{"note" => note} when is_binary(note) -> note
+            %{note: note} when is_binary(note) -> note
+            _ -> ""
+          end
+
+        body =
+          Keyword.get(opts, :body) ||
+            (payload_note != "" && payload_note) ||
+            (is_binary(cp.label) && cp.label) ||
+            ""
+
+        title = Keyword.get(opts, :title) || cp.label || "Checkpoint skill"
+
+        if body == "" do
+          {:error, :empty_checkpoint}
+        else
+          create_skill(%{
+            title: title,
+            body: body,
+            keywords: Keyword.get(opts, :keywords) || title,
+            session_id: session_id,
+            project_id: Keyword.get(opts, :project_id),
+            source: "checkpoint_promotion"
+          })
+        end
+    end
+  end
+
   def append_evolution_log_line(session_id, line) when is_binary(line) do
     if Application.get_env(:flux_claw, :agents, [])[:self_evolve] == false do
       :ok

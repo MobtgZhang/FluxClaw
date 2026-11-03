@@ -10,6 +10,7 @@ defmodule FluxClaw.Tool do
           {:ok, String.t()}
           | {:error, String.t()}
           | {:suspend_ask, pos_integer(), String.t()}
+          | {:suspend_review, pos_integer(), map()}
           | {:ok, String.t(), Keyword.t()}
 
   @callback name() :: String.t()
@@ -21,11 +22,13 @@ defmodule FluxClaw.Tool do
     FluxClaw.Tools.FileRead,
     FluxClaw.Tools.FileWrite,
     FluxClaw.Tools.FilePatch,
+    FluxClaw.Tools.ApplyPatch,
     FluxClaw.Tools.ShellExecute,
     FluxClaw.Tools.WebFetch,
     FluxClaw.Tools.TaskPlan,
     FluxClaw.Tools.AskUser,
     FluxClaw.Tools.UpdateCheckpoint,
+    FluxClaw.Tools.PromoteCheckpoint,
     FluxClaw.Tools.LongTermFact
   ]
 

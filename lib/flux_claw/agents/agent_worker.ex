@@ -131,23 +131,13 @@ defmodule FluxClaw.Agents.AgentWorker do
 
   defp assistant_plain_content_to_llm(_), do: []
 
-  defp tool_phase(nil), do: nil
-
   defp tool_phase(meta) when is_map(meta) do
     Map.get(meta, "phase") || Map.get(meta, :phase)
   end
 
-  defp tool_phase(_), do: nil
-
-  defp call_id_from_meta(nil), do: "call"
-
   defp call_id_from_meta(meta) when is_map(meta) do
     Map.get(meta, "call_id") || Map.get(meta, :call_id) || "call"
   end
-
-  defp call_id_from_meta(_), do: "call"
-
-  defp tool_calls_from_meta(nil), do: []
 
   defp tool_calls_from_meta(meta) when is_map(meta) do
     raw = Map.get(meta, "tool_calls") || Map.get(meta, :tool_calls)
@@ -158,8 +148,6 @@ defmodule FluxClaw.Agents.AgentWorker do
       true -> []
     end
   end
-
-  defp tool_calls_from_meta(_), do: []
 
   defp tool_name(call), do: get_in(call, ["function", "name"]) || "tool"
 
@@ -280,7 +268,39 @@ defmodule FluxClaw.Agents.AgentWorker do
     end
   end
 
+  def handle_info({:diff_review_reply, ref, decision}, state) when is_integer(ref) do
+    case state.pending do
+      %{ref: ^ref, call: call, rest: rest, prefix: prefix, tool_acc: acc, review: payload} ->
+        text = resolve_review_decision(decision, payload)
+        broadcast(state.session_id, {:diff_reviewed, ref, decision})
+        append_tool_result(call, rest, state, prefix, acc, text, [])
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:diff_review_reply, _ref, _decision}, state), do: {:noreply, state}
+
   def handle_info(_other, state), do: {:noreply, state}
+
+  defp resolve_review_decision(decision, payload) do
+    if decision in ["keep", "accept", "apply", true] do
+      case FluxClaw.Tools.Review.apply_kept(payload) do
+        {:ok, msg} -> msg <> "\n\n" <> diff_block(Map.get(payload, "diff", ""))
+        {:error, e} -> "error keeping patch: " <> inspect(e)
+      end
+    else
+      "rejected by user: no changes were written"
+    end
+  end
+
+  defp diff_block(nil), do: ""
+
+  defp diff_block(diff) when is_binary(diff),
+    do: "```diff\n" <> String.trim_trailing(diff, "\n") <> "\n```"
+
+  defp diff_block(_), do: ""
 
   defp apply_llm_response(state, resp) do
     reasoning = Map.get(resp, :reasoning) || Map.get(resp, "reasoning")
@@ -416,6 +436,21 @@ defmodule FluxClaw.Agents.AgentWorker do
             rest: rest,
             prefix: prefix,
             tool_acc: tool_acc
+          }
+
+          {:noreply, %{state | pending: pending}}
+
+        {:suspend_review, ref, payload} ->
+          # Diff-review flow: propose the change and wait for keep/reject.
+          broadcast(state.session_id, {:diff_proposed, ref, payload})
+
+          pending = %{
+            ref: ref,
+            call: call,
+            rest: rest,
+            prefix: prefix,
+            tool_acc: tool_acc,
+            review: payload
           }
 
           {:noreply, %{state | pending: pending}}

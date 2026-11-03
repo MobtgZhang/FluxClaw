@@ -254,7 +254,7 @@ defmodule FluxClaw.LLM.OpenAI do
         fn_map = tc["function"] || %{}
         cur = Map.get(acc, idx, %{id: nil, name: nil, arguments: ""})
 
-        cur = if id = tc["id"], do: %{cur | id: id || cur.id}, else: cur
+        cur = if id = tc["id"], do: %{cur | id: id}, else: cur
         cur = if n = fn_map["name"], do: %{cur | name: n}, else: cur
         arg = fn_map["arguments"] || ""
         cur = %{cur | arguments: (cur.arguments || "") <> arg}
