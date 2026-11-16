@@ -25,6 +25,8 @@ defmodule FluxClaw.Tool do
     FluxClaw.Tools.ApplyPatch,
     FluxClaw.Tools.ShellExecute,
     FluxClaw.Tools.WebFetch,
+    FluxClaw.Tools.AgentSearch,
+    FluxClaw.Tools.Harness2,
     FluxClaw.Tools.TaskPlan,
     FluxClaw.Tools.AskUser,
     FluxClaw.Tools.UpdateCheckpoint,
@@ -47,32 +49,19 @@ defmodule FluxClaw.Tool do
         }
       end)
 
-    builtins ++ FluxClaw.Plugins.CordisRuntime.list_tools()
+    names = MapSet.new(Enum.map(@modules, & &1.name()))
+
+    builtins ++
+      Enum.reject(
+        FluxClaw.Plugins.CordisRuntime.list_tools(),
+        &MapSet.member?(names, &1.function.name)
+      )
   end
 
   def run(name, args, ctx) when is_binary(name) and is_map(args) do
-    case FluxClaw.Plugins.CordisRuntime.call_tool(name, args, ctx) do
-      {:ok, content} when is_binary(content) ->
-        {:ok, content}
-
-      {:error, :plugin_runtime_unavailable} ->
-        run_builtin(name, args, ctx)
-
-      {:error, "plugin tool not found: " <> _} ->
-        run_builtin(name, args, ctx)
-
-      other ->
-        other
-    end
-  end
-
-  defp run_builtin(name, args, ctx) do
-    mod = Enum.find(@modules, &(&1.name() == name))
-
-    if mod do
-      mod.run(args, ctx)
-    else
-      {:error, "unknown tool #{name}"}
+    case Enum.find(@modules, &(&1.name() == name)) do
+      nil -> FluxClaw.Plugins.CordisRuntime.call_tool(name, args, ctx)
+      module -> module.run(args, ctx)
     end
   end
 

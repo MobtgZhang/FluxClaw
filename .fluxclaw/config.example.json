@@ -11,6 +11,12 @@
   "agents": {
     "max_steps": 32
   },
+  "integrations": {
+    "search_url": "",
+    "search_mode": "local",
+    "search_key": "",
+    "python": ""
+  },
   "cache_paths": {
     "cache_root": "./fluxclaw/cache",
     "external_skills": "",

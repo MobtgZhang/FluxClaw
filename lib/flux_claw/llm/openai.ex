@@ -64,6 +64,7 @@ defmodule FluxClaw.LLM.OpenAI do
       case Req.post(url,
              headers: headers(api_key),
              json: body,
+             retry: Keyword.get(opts, :retry, :safe_transient),
              receive_timeout: Keyword.get(opts, :timeout, 120_000)
            ) do
         {:ok, %{status: 200, body: body}} ->
