@@ -63,14 +63,22 @@ defmodule FluxClawWeb.ChatLive do
     |> assign(:settings_models, [])
     |> assign(:agent_busy, false)
     |> assign(:sidebar_collapsed, false)
-    |> assign(:right_open, true)
-    |> assign(:right_tab, :plugins)
+    |> assign(:right_open, false)
+    |> assign(:right_tab, :memory)
     |> assign(:pending_diff, nil)
     |> assign(:plugins_info, plugins_summary())
     |> assign(:chat_subscribed_topic, nil)
     |> assign(:user_variant_idx, %{})
     |> assign(:user_edit_meta, %{})
     |> assign(:editing_user_msg, nil)
+    |> assign(:composer_form, to_form(%{"text" => ""}))
+    |> assign(:answer_form, to_form(%{"text" => ""}))
+    |> assign(:attachment_form, to_form(%{}, as: :attachment))
+    |> assign(:run_status, nil)
+    |> assign(:integration_form, integration_form())
+    |> allow_upload(:attachments, accept: :any, max_entries: 5, max_file_size: 8_000_000)
+    |> stream(:artifacts, [])
+    |> stream(:turns, [])
   end
 
   defp wire_pubsub_after_static_render(socket) do
@@ -84,6 +92,20 @@ defmodule FluxClawWeb.ChatLive do
     else
       socket
     end
+  end
+
+  defp integration_form do
+    cfg = FluxClaw.Integrations.config()
+
+    to_form(
+      %{
+        "search_url" => cfg.search_url,
+        "search_mode" => cfg.search_mode,
+        "search_key" => "",
+        "python" => cfg.python
+      },
+      as: :integrations
+    )
   end
 
   defp settings_form_defaults do
@@ -160,7 +182,12 @@ defmodule FluxClawWeb.ChatLive do
   end
 
   @impl true
-  def handle_params(params, _uri, socket) do
+  def handle_params(params, uri, socket) do
+    {:noreply, next} = dispatch_params(params, uri, socket)
+    {:noreply, sync_turns(next)}
+  end
+
+  defp dispatch_params(params, _uri, socket) do
     projects = Projects.list_projects()
     socket = assign(socket, :projects, projects)
 
@@ -374,7 +401,11 @@ defmodule FluxClawWeb.ChatLive do
           "start" ->
             args = decode_tool_args(m.content)
             n = m.tool_name || "tool"
-            [{:tool_start, n, args}]
+
+            case Map.get(m.metadata, "call_id") do
+              nil -> [{:tool_start, n, args}]
+              id -> [{:tool_start, id, n, args}]
+            end
 
           "done" ->
             id = meta_call_id(m.metadata)
@@ -393,12 +424,15 @@ defmodule FluxClawWeb.ChatLive do
         c = message_content_string(m.content)
 
         cond do
+          Map.get(m.metadata || %{}, "stopped") == true ->
+            answer = if c != "", do: [{:history, "assistant", c, m.id}], else: []
+            answer ++ [{:stopped, m.id}]
+
           tc != [] and c != "" ->
             [{:history, "assistant", c, m.id}]
 
           tc != [] ->
-            # 仅有 tool_calls、正文为空时仍占一条，避免历史里「用户下一条直接是工具」看起来像丢消息
-            [{:history, "assistant", "（已发起工具调用）", m.id}]
+            []
 
           true ->
             if c != "", do: [{:history, "assistant", c, m.id}], else: []
@@ -426,8 +460,6 @@ defmodule FluxClawWeb.ChatLive do
   defp meta_call_id(meta) when is_map(meta) do
     Map.get(meta, "call_id") || Map.get(meta, :call_id) || "call"
   end
-
-  defp meta_call_id(_), do: "call"
 
   defp meta_tool_calls_list(nil), do: []
 
@@ -467,11 +499,137 @@ defmodule FluxClawWeb.ChatLive do
   defp parse_px(n) when is_float(n), do: round(n)
 
   @impl true
-  def handle_event("toggle_sidebar", _params, socket) do
+  def handle_event(event, params, socket) do
+    case dispatch_event(event, params, socket) do
+      {:noreply, next} -> {:noreply, sync_turns(next)}
+      {:reply, reply, next} -> {:reply, reply, sync_turns(next)}
+    end
+  end
+
+  @impl true
+  def handle_info(message, socket) do
+    {:noreply, next} = dispatch_info(message, socket)
+    {:noreply, sync_turns(next)}
+  end
+
+  defp sync_turns(socket) do
+    source =
+      {socket.assigns.log, socket.assigns.user_edit_meta, socket.assigns.user_variant_idx,
+       socket.assigns.editing_user_msg}
+
+    sid = socket.assigns.session && socket.assigns.session.id
+
+    socket =
+      if socket.assigns[:artifact_session] != sid do
+        socket |> assign(:artifact_session, sid) |> stream(:artifacts, [], reset: true)
+      else
+        socket
+      end
+
+    if socket.assigns[:turn_source] == source do
+      socket
+    else
+      turns =
+        chat_slices(
+          socket.assigns.log,
+          socket.assigns.user_edit_meta,
+          socket.assigns.user_variant_idx
+        )
+        |> Enum.with_index()
+        |> Enum.map(fn {slice, index} ->
+          id =
+            case slice do
+              {:user_turn, id, _, _, _, _} when not is_nil(id) -> "user-#{id}"
+              _ -> "plain-#{index}"
+            end
+
+          %{id: id, slice: slice}
+        end)
+
+      socket |> assign(:turn_source, source) |> stream(:turns, turns, reset: true)
+    end
+  end
+
+  defp dispatch_event("save_integrations", %{"integrations" => params}, socket) do
+    url = String.trim(params["search_url"] || "")
+    mode = params["search_mode"] || "local"
+    uri = URI.parse(url)
+
+    if mode in ["local", "sciphi"] and
+         (url == "" or (uri.scheme in ["http", "https"] and uri.host not in [nil, ""])) do
+      updates = Map.take(params, ["search_url", "search_mode", "python"])
+
+      updates =
+        if String.trim(params["search_key"] || "") == "",
+          do: updates,
+          else: Map.put(updates, "search_key", params["search_key"])
+
+      FluxClaw.ConfigLoader.merge_save!(%{"integrations" => updates})
+
+      {:noreply,
+       socket
+       |> assign(:integration_form, integration_form())
+       |> put_flash(:info, "工具配置已保存；服务连通性将在实际调用时验证。")}
+    else
+      {:noreply, put_flash(socket, :error, "请填写有效的 http(s) 服务地址。")}
+    end
+  end
+
+  defp dispatch_event("refresh_artifacts", _, socket) do
+    files =
+      if socket.assigns.session, do: FluxClaw.Artifacts.list(socket.assigns.session.id), else: []
+
+    {:noreply, stream(socket, :artifacts, files, reset: true)}
+  end
+
+  defp dispatch_event("validate_upload", _, socket), do: {:noreply, socket}
+
+  defp dispatch_event("upload_files", _, socket) do
+    if socket.assigns.session do
+      root = FluxClaw.Artifacts.root(socket.assigns.session.id)
+
+      paths =
+        consume_uploaded_entries(socket, :attachments, fn %{path: source}, entry ->
+          relative = "uploads/" <> Ecto.UUID.generate() <> "-" <> Path.basename(entry.client_name)
+
+          with {:ok, destination} <- FluxClaw.Tools.Sandbox.resolve!(root, relative),
+               :ok <- File.mkdir_p(Path.dirname(destination)),
+               :ok <- File.cp(source, destination) do
+            {:ok, relative}
+          else
+            _ -> {:postpone, :retry}
+          end
+        end)
+
+      socket =
+        socket
+        |> stream(:artifacts, FluxClaw.Artifacts.list(socket.assigns.session.id), reset: true)
+        |> push_event("composer-attach", %{paths: paths})
+
+      {:noreply, put_flash(socket, :info, "附件已保存到当前任务；可在输入框中说明处理方式。")}
+    else
+      {:noreply, put_flash(socket, :error, "请先发送任务以创建会话，再添加附件。")}
+    end
+  end
+
+  defp dispatch_event("fill_example", %{"text" => text}, socket) do
+    {:noreply, push_event(socket, "composer-fill", %{text: text})}
+  end
+
+  defp dispatch_event("close_drawers", _, socket) do
+    {:noreply,
+     socket
+     |> assign(:sidebar_open, false)
+     |> assign(:right_open, false)
+     |> assign(:context_menu, nil)
+     |> assign(:menu_anchor, nil)}
+  end
+
+  defp dispatch_event("toggle_sidebar", _params, socket) do
     {:noreply, update(socket, :sidebar_open, &(!&1))}
   end
 
-  def handle_event("toggle_settings", _params, socket) do
+  defp dispatch_event("toggle_settings", _params, socket) do
     open = !socket.assigns.settings_open
 
     socket =
@@ -484,7 +642,7 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, assign(socket, :settings_open, open)}
   end
 
-  def handle_event("close_menu", _params, socket) do
+  defp dispatch_event("close_menu", _params, socket) do
     {:noreply,
      assign(socket,
        menu: nil,
@@ -494,7 +652,7 @@ defmodule FluxClawWeb.ChatLive do
      )}
   end
 
-  def handle_event("open_context_menu", params, socket) do
+  defp dispatch_event("open_context_menu", params, socket) do
     t = params["type"]
     id = params["id"]
 
@@ -514,7 +672,7 @@ defmodule FluxClawWeb.ChatLive do
      )}
   end
 
-  def handle_event("toggle_nav", %{"section" => section}, socket) do
+  defp dispatch_event("toggle_nav", %{"section" => section}, socket) do
     nav = socket.assigns.nav_open
 
     if Map.has_key?(nav, section) do
@@ -525,7 +683,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("toggle_menu", %{"type" => type, "id" => id}, socket) do
+  defp dispatch_event("toggle_menu", %{"type" => type, "id" => id}, socket) do
     cur = socket.assigns.menu
 
     menu =
@@ -538,7 +696,7 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, assign(socket, menu: menu, move_target: nil)}
   end
 
-  def handle_event("open_move", %{"type" => type, "id" => id}, socket) do
+  defp dispatch_event("open_move", %{"type" => type, "id" => id}, socket) do
     {:noreply,
      assign(socket,
        move_target: {type, id},
@@ -548,7 +706,7 @@ defmodule FluxClawWeb.ChatLive do
      )}
   end
 
-  def handle_event("new_project", %{"title" => title}, socket) do
+  defp dispatch_event("new_project", %{"title" => title}, socket) do
     title = if title in [nil, ""], do: "新项目", else: title
 
     case Projects.create_project(%{title: title}) do
@@ -563,14 +721,14 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("new_project", _params, socket) do
+  defp dispatch_event("new_project", _params, socket) do
     case Projects.create_project(%{title: "新项目"}) do
       {:ok, p} -> {:noreply, push_patch(socket, to: ~p"/p/#{p.id}")}
       {:error, _} -> {:noreply, put_flash(socket, :error, "创建失败")}
     end
   end
 
-  def handle_event("new_chat", %{"title" => title}, socket) do
+  defp dispatch_event("new_chat", %{"title" => title}, socket) do
     title = if title in [nil, ""], do: "新对话", else: title
 
     pid =
@@ -585,7 +743,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("new_chat", _params, socket) do
+  defp dispatch_event("new_chat", _params, socket) do
     pid =
       case socket.assigns.project do
         %{id: id} -> id
@@ -598,7 +756,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("delete_session", %{"id" => id}, socket) do
+  defp dispatch_event("delete_session", %{"id" => id}, socket) do
     case Agents.get_session(id) do
       nil ->
         {:noreply, put_flash(socket, :error, "会话不存在")}
@@ -618,7 +776,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("delete_skill", %{"id" => id}, socket) do
+  defp dispatch_event("delete_skill", %{"id" => id}, socket) do
     _ = Memory.delete_skill(id)
 
     sk =
@@ -637,7 +795,7 @@ defmodule FluxClawWeb.ChatLive do
      )}
   end
 
-  def handle_event("delete_project", %{"id" => id}, socket) do
+  defp dispatch_event("delete_project", %{"id" => id}, socket) do
     case Projects.get_project(id) do
       nil ->
         {:noreply, put_flash(socket, :error, "项目不存在")}
@@ -658,7 +816,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("rename_project", %{"row_id" => id, "title" => title}, socket) do
+  defp dispatch_event("rename_project", %{"row_id" => id, "title" => title}, socket) do
     title = String.trim(title || "")
 
     if title == "" do
@@ -675,7 +833,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("rename_session", %{"row_id" => id, "title" => title}, socket) do
+  defp dispatch_event("rename_session", %{"row_id" => id, "title" => title}, socket) do
     title = String.trim(title || "")
 
     if title == "" do
@@ -704,7 +862,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("start_edit", %{"kind" => kind, "id" => id}, socket) do
+  defp dispatch_event("start_edit", %{"kind" => kind, "id" => id}, socket) do
     {:noreply,
      assign(socket,
        editing: {kind, id},
@@ -714,11 +872,11 @@ defmodule FluxClawWeb.ChatLive do
      )}
   end
 
-  def handle_event("cancel_edit", _params, socket) do
+  defp dispatch_event("cancel_edit", _params, socket) do
     {:noreply, assign(socket, editing: nil)}
   end
 
-  def handle_event("move_session", %{"id" => sid, "project_id" => pid}, socket) do
+  defp dispatch_event("move_session", %{"id" => sid, "project_id" => pid}, socket) do
     case Agents.get_session(sid) do
       nil ->
         {:noreply, put_flash(socket, :error, "会话不存在")}
@@ -729,7 +887,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("move_skill", %{"id" => skill_id, "project_id" => pid}, socket) do
+  defp dispatch_event("move_skill", %{"id" => skill_id, "project_id" => pid}, socket) do
     case Memory.move_skill_to_project(skill_id, pid) do
       {:ok, _} ->
         sk =
@@ -746,7 +904,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("open_skill_editor", %{"id" => id}, socket) do
+  defp dispatch_event("open_skill_editor", %{"id" => id}, socket) do
     case Memory.get_skill(id) do
       nil ->
         {:noreply, put_flash(socket, :error, "技能不存在")}
@@ -771,7 +929,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("open_skill_editor_new", _params, socket) do
+  defp dispatch_event("open_skill_editor_new", _params, socket) do
     {:noreply,
      socket
      |> assign(
@@ -783,7 +941,7 @@ defmodule FluxClawWeb.ChatLive do
      |> push_event("mde_set_value", %{body: ""})}
   end
 
-  def handle_event("open_skill_import", _params, socket) do
+  defp dispatch_event("open_skill_import", _params, socket) do
     files = Memory.list_skill_import_files()
 
     {:noreply,
@@ -795,11 +953,11 @@ defmodule FluxClawWeb.ChatLive do
      )}
   end
 
-  def handle_event("close_skill_import", _params, socket) do
+  defp dispatch_event("close_skill_import", _params, socket) do
     {:noreply, assign(socket, :skill_import_open, false)}
   end
 
-  def handle_event("import_skill_pick", %{"path" => path}, socket) do
+  defp dispatch_event("import_skill_pick", %{"path" => path}, socket) do
     path = String.trim(path || "")
 
     pid =
@@ -826,11 +984,11 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, socket}
   end
 
-  def handle_event("close_skill_editor", _params, socket) do
+  defp dispatch_event("close_skill_editor", _params, socket) do
     {:noreply, assign(socket, :skill_editor, nil)}
   end
 
-  def handle_event("save_skill_editor", params, socket) do
+  defp dispatch_event("save_skill_editor", params, socket) do
     title = params["title"] |> to_string() |> String.trim()
     body = params["body"] |> to_string() |> String.trim()
     keywords = Map.get(params, "keywords", "")
@@ -890,7 +1048,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("external_link_click", %{"url" => url, "title" => title}, socket) do
+  defp dispatch_event("external_link_click", %{"url" => url, "title" => title}, socket) do
     url = String.trim(url || "")
 
     if url == "" do
@@ -903,11 +1061,11 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("cancel_external_link", _params, socket) do
+  defp dispatch_event("cancel_external_link", _params, socket) do
     {:noreply, assign(socket, :external_link_prompt, nil)}
   end
 
-  def handle_event("confirm_external_link", _params, socket) do
+  defp dispatch_event("confirm_external_link", _params, socket) do
     case socket.assigns.external_link_prompt do
       nil ->
         {:noreply, socket}
@@ -922,17 +1080,17 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("settings_pick_model", %{"picked" => picked}, socket) do
+  defp dispatch_event("settings_pick_model", %{"picked" => picked}, socket) do
     picked = String.trim(picked || "")
     form = Map.put(socket.assigns.settings_form, "model", picked)
     {:noreply, assign(socket, :settings_form, form)}
   end
 
-  def handle_event("settings_pick_model", _params, socket) do
+  defp dispatch_event("settings_pick_model", _params, socket) do
     {:noreply, socket}
   end
 
-  def handle_event("refresh_models", _params, socket) do
+  defp dispatch_event("refresh_models", _params, socket) do
     case FluxClaw.LLM.OpenAI.list_models() do
       {:ok, ids} ->
         {:noreply,
@@ -961,7 +1119,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("save_settings", params, socket) do
+  defp dispatch_event("save_settings", params, socket) do
     base_url = Map.get(params, "base_url", "") || ""
     model = Map.get(params, "model", "") || ""
     max_steps_str = Map.get(params, "max_steps", "") || ""
@@ -1097,7 +1255,7 @@ defmodule FluxClawWeb.ChatLive do
      |> assign(:settings_form, settings_form_defaults())}
   end
 
-  def handle_event("accept_skill_proposal", _params, socket) do
+  defp dispatch_event("accept_skill_proposal", _params, socket) do
     case socket.assigns.skill_proposal do
       nil ->
         {:noreply, socket}
@@ -1132,17 +1290,23 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("dismiss_skill_proposal", _params, socket) do
+  defp dispatch_event("dismiss_skill_proposal", _params, socket) do
     {:noreply, assign(socket, :skill_proposal, nil)}
   end
 
-  def handle_event("stop_agent", _params, socket) do
+  defp dispatch_event("stop_agent", _params, socket) do
     case socket.assigns.session do
       %{id: sid} ->
         stop_session_worker(sid)
+        partial = socket.assigns.draft_assistant || ""
+        {:ok, _} = Agents.record_stop(sid, partial)
 
         {:noreply,
          socket
+         |> reload_chat_from_db()
+         |> assign(:run_status, "已停止 · 已完成的操作和部分回答已保留")
+         |> assign(:pending_ask, nil)
+         |> assign(:pending_diff, nil)
          |> assign(:agent_busy, false)
          |> assign(:draft_assistant, nil)
          |> assign(:draft_reasoning, nil)}
@@ -1152,12 +1316,16 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("send", %{"text" => text}, socket) do
+  defp dispatch_event("send", %{"text" => text}, socket) do
     text = String.trim(text)
 
     cond do
       text == "" ->
         {:noreply, socket}
+
+      socket.assigns.agent_busy || socket.assigns.pending_ask != nil ||
+          socket.assigns.pending_diff != nil ->
+        {:noreply, put_flash(socket, :info, "请先停止当前任务或回复待处理的问题")}
 
       is_nil(socket.assigns.session) ->
         case socket.assigns.project do
@@ -1170,7 +1338,11 @@ defmodule FluxClawWeb.ChatLive do
                 case Agents.append_message(s.id, %{role: "user", content: text}) do
                   {:ok, _} ->
                     _ = Orchestrator.ensure_worker(s.id)
-                    {:noreply, push_patch(socket, to: ~p"/chat/#{s.id}")}
+
+                    {:noreply,
+                     socket
+                     |> push_event("composer-clear", %{})
+                     |> push_patch(to: ~p"/chat/#{s.id}")}
 
                   {:error, _} ->
                     {:noreply, put_flash(socket, :error, "发送失败")}
@@ -1183,38 +1355,41 @@ defmodule FluxClawWeb.ChatLive do
 
       true ->
         Orchestrator.send_message(socket.assigns.session.id, text)
-        {:noreply, assign(socket, :agent_busy, true)}
+
+        {:noreply,
+         socket
+         |> assign(:agent_busy, true)
+         |> assign(:run_status, nil)
+         |> push_event("composer-clear", %{})}
     end
   end
 
-  def handle_event("answer_user", %{"ref" => ref_str, "text" => text}, socket) do
-    text = String.trim(text)
-    ref = String.to_integer(ref_str)
-
-    socket =
-      if text != "" && socket.assigns.session do
-        Orchestrator.reply_ask_user(socket.assigns.session.id, ref, text)
-        assign(socket, :agent_busy, true)
-      else
-        socket
-      end
-
-    {:noreply, assign(socket, :pending_ask, nil)}
+  defp dispatch_event("answer_user", %{"ref" => ref_str, "text" => text}, socket) do
+    with {ref, ""} <- Integer.parse(ref_str),
+         %{ref: ^ref} <- socket.assigns.pending_ask,
+         %{id: sid} <- socket.assigns.session,
+         answer when answer != "" <- String.trim(text) do
+      Orchestrator.reply_ask_user(sid, ref, answer)
+      {:noreply, socket |> assign(:agent_busy, true) |> assign(:pending_ask, nil)}
+    else
+      _ -> {:noreply, socket}
+    end
   end
 
-  def handle_event("toggle_sidebar_rail", _params, socket) do
+  defp dispatch_event("toggle_sidebar_rail", _params, socket) do
     {:noreply, update(socket, :sidebar_collapsed, &(!&1))}
   end
 
-  def handle_event("toggle_right", _params, socket) do
+  defp dispatch_event("toggle_right", _params, socket) do
     {:noreply, update(socket, :right_open, &(!&1))}
   end
 
-  def handle_event("set_right_tab", %{"tab" => tab}, socket) do
+  defp dispatch_event("set_right_tab", %{"tab" => tab}, socket) do
     tab =
       case tab do
         "timeline" -> :timeline
         "memory" -> :memory
+        "files" -> :files
         "plugins" -> :plugins
         _ -> :plugins
       end
@@ -1222,7 +1397,7 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, socket |> assign(:right_tab, tab) |> assign(:right_open, true)}
   end
 
-  def handle_event("review_diff", %{"ref" => ref_str, "decision" => decision}, socket) do
+  defp dispatch_event("review_diff", %{"ref" => ref_str, "decision" => decision}, socket) do
     ref = String.to_integer(ref_str)
     decision = if decision in ["keep", "accept", "apply", "true"], do: "keep", else: "reject"
 
@@ -1239,16 +1414,16 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, assign(socket, :pending_diff, nil)}
   end
 
-  def handle_event("refresh_plugins", _params, socket) do
+  defp dispatch_event("refresh_plugins", _params, socket) do
     {:noreply, refresh_plugins_info(socket)}
   end
 
-  def handle_event("copy_assistant_text", %{"id" => id_str}, socket) do
+  defp dispatch_event("copy_assistant_text", %{"id" => id_str}, socket) do
     text = assistant_plaintext_from_db(socket, id_str) || ""
     {:noreply, push_event(socket, "clipboard-copy", %{text: text})}
   end
 
-  def handle_event("export_assistant_md", %{"id" => id_str}, socket) do
+  defp dispatch_event("export_assistant_md", %{"id" => id_str}, socket) do
     text = assistant_plaintext_from_db(socket, id_str) || ""
     slug = id_str |> String.trim() |> String.replace("-", "") |> String.slice(0, 8)
     name = "fluxclaw-reply-#{slug}.md"
@@ -1261,7 +1436,7 @@ defmodule FluxClawWeb.ChatLive do
      })}
   end
 
-  def handle_event("regenerate_assistant", %{"id" => id_str}, socket) do
+  defp dispatch_event("regenerate_assistant", %{"id" => id_str}, socket) do
     id_str = String.trim(id_str)
 
     with %{session: %{id: sid}} <- socket.assigns,
@@ -1288,7 +1463,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("copy_user_text", %{"id" => id_str}, socket) do
+  defp dispatch_event("copy_user_text", %{"id" => id_str}, socket) do
     id_str = String.trim(id_str)
 
     text =
@@ -1305,7 +1480,7 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, push_event(socket, "clipboard-copy", %{text: text || ""})}
   end
 
-  def handle_event("start_edit_user", %{"id" => id_str}, socket) do
+  defp dispatch_event("start_edit_user", %{"id" => id_str}, socket) do
     id_str = String.trim(id_str)
 
     txt =
@@ -1341,11 +1516,11 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("cancel_edit_user", _, socket) do
+  defp dispatch_event("cancel_edit_user", _, socket) do
     {:noreply, assign(socket, :editing_user_msg, nil)}
   end
 
-  def handle_event("user_variant_step", %{"id" => id_str, "dir" => dir_s}, socket) do
+  defp dispatch_event("user_variant_step", %{"id" => id_str, "dir" => dir_s}, socket) do
     dir = String.to_integer(dir_s)
     id_str = String.trim(id_str)
 
@@ -1363,7 +1538,7 @@ defmodule FluxClawWeb.ChatLive do
     end
   end
 
-  def handle_event("submit_user_edit", %{"user_message_id" => id_str, "text" => text}, socket) do
+  defp dispatch_event("submit_user_edit", %{"user_message_id" => id_str, "text" => text}, socket) do
     text = String.trim(text)
     id_str = String.trim(id_str)
 
@@ -1488,8 +1663,7 @@ defmodule FluxClawWeb.ChatLive do
 
   defp diff_lines(_), do: []
 
-  @impl true
-  def handle_info({:user, text, id}, socket) do
+  defp dispatch_info({:user, text, id}, socket) do
     id_key = to_string(id)
 
     meta =
@@ -1505,11 +1679,11 @@ defmodule FluxClawWeb.ChatLive do
      |> assign(:log, socket.assigns.log ++ [{:user, text, id}])}
   end
 
-  def handle_info({:user, text}, socket) do
+  defp dispatch_info({:user, text}, socket) do
     {:noreply, assign(socket, :log, socket.assigns.log ++ [{:user, text, nil}])}
   end
 
-  def handle_info({:session_title_updated, title}, socket) do
+  defp dispatch_info({:session_title_updated, title}, socket) do
     sess = socket.assigns.session
 
     socket =
@@ -1525,12 +1699,12 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, socket}
   end
 
-  def handle_info({:reasoning_delta, text}, socket) do
+  defp dispatch_info({:reasoning_delta, text}, socket) do
     cur = socket.assigns.draft_reasoning || ""
     {:noreply, assign(socket, :draft_reasoning, cur <> text)}
   end
 
-  def handle_info({:reasoning_done, text}, socket) do
+  defp dispatch_info({:reasoning_done, text}, socket) do
     socket =
       socket
       |> assign(:draft_reasoning, nil)
@@ -1539,12 +1713,12 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, socket}
   end
 
-  def handle_info({:assistant_delta, text}, socket) do
+  defp dispatch_info({:assistant_delta, text}, socket) do
     cur = socket.assigns.draft_assistant || ""
     {:noreply, assign(socket, :draft_assistant, cur <> text)}
   end
 
-  def handle_info({:assistant_done, text, msg_id}, socket) do
+  defp dispatch_info({:assistant_done, text, msg_id}, socket) do
     entry =
       case msg_id do
         nil -> {:assistant, text}
@@ -1574,30 +1748,34 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, socket}
   end
 
-  def handle_info({:assistant_done, text}, socket) do
-    handle_info({:assistant_done, text, nil}, socket)
+  defp dispatch_info({:assistant_done, text}, socket) do
+    dispatch_info({:assistant_done, text, nil}, socket)
   end
 
-  def handle_info({:tool_start, name, args}, socket) do
+  defp dispatch_info({:tool_start, id, name, args}, socket) do
+    {:noreply, socket |> push_log({:tool_start, id, name, args}) |> assign(:agent_busy, true)}
+  end
+
+  defp dispatch_info({:tool_start, name, args}, socket) do
     {:noreply, socket |> push_log({:tool_start, name, args}) |> assign(:agent_busy, true)}
   end
 
-  def handle_info({:tool_done, id, name, text}, socket) do
+  defp dispatch_info({:tool_done, id, name, text}, socket) do
     {:noreply, socket |> push_log({:tool_done, id, name, text}) |> assign(:agent_busy, true)}
   end
 
-  def handle_info({:ask_user, ref, question}, socket) do
+  defp dispatch_info({:ask_user, ref, question}, socket) do
     {:noreply,
      socket
      |> assign(:pending_ask, %{ref: ref, question: question})
      |> assign(:agent_busy, false)}
   end
 
-  def handle_info({:skill_proposal, attrs}, socket) do
+  defp dispatch_info({:skill_proposal, attrs}, socket) do
     {:noreply, assign(socket, :skill_proposal, attrs)}
   end
 
-  def handle_info({:skill_saved, _title}, socket) do
+  defp dispatch_info({:skill_saved, _title}, socket) do
     sk =
       if p = socket.assigns.project do
         Memory.list_skills_for_project(p.id)
@@ -1608,11 +1786,14 @@ defmodule FluxClawWeb.ChatLive do
     {:noreply, assign(socket, :skills_sidebar, sk)}
   end
 
-  def handle_info({:error, reason}, socket) do
-    {:noreply, socket |> put_flash(:error, inspect(reason)) |> assign(:agent_busy, false)}
+  defp dispatch_info({:error, reason}, socket) do
+    {:noreply,
+     socket
+     |> assign(:run_status, "模型请求失败：" <> short_error_body(reason))
+     |> assign(:agent_busy, false)}
   end
 
-  def handle_info({:diff_proposed, ref, payload}, socket) do
+  defp dispatch_info({:diff_proposed, ref, payload}, socket) do
     pending = Map.put(Map.new(payload || %{}), "ref", ref)
 
     {:noreply,
@@ -1621,25 +1802,25 @@ defmodule FluxClawWeb.ChatLive do
      |> assign(:agent_busy, false)}
   end
 
-  def handle_info({:diff_reviewed, _ref, _decision}, socket) do
+  defp dispatch_info({:diff_reviewed, _ref, _decision}, socket) do
     socket = sync_agent_busy_from_db(socket)
 
     {:noreply, assign(socket, :pending_diff, nil)}
   end
 
-  def handle_info({:plugin_loaded, _id}, socket) do
+  defp dispatch_info({:plugin_loaded, _id}, socket) do
     {:noreply, refresh_plugins_info(socket)}
   end
 
-  def handle_info({:plugin_tool_registered, _plugin_id, _name}, socket) do
+  defp dispatch_info({:plugin_tool_registered, _plugin_id, _name}, socket) do
     {:noreply, refresh_plugins_info(socket)}
   end
 
-  def handle_info({:plugin_tool_unregistered, _name}, socket) do
+  defp dispatch_info({:plugin_tool_unregistered, _name}, socket) do
     {:noreply, refresh_plugins_info(socket)}
   end
 
-  def handle_info(_other, socket), do: {:noreply, socket}
+  defp dispatch_info(_other, socket), do: {:noreply, socket}
 
   defp push_log(socket, entry) do
     assign(socket, :log, socket.assigns.log ++ [entry])
@@ -1676,25 +1857,19 @@ defmodule FluxClawWeb.ChatLive do
   end
 
   defp grouped_log_entries(log) do
-    Enum.reduce(log, [], fn entry, acc ->
-      case entry do
-        {:tool_start, _, _} -> append_tool_chunk(acc, entry)
-        {:tool_done, _, _, _} -> append_tool_chunk(acc, entry)
-        _ -> acc ++ [entry]
-      end
-    end)
-  end
+    {entries, tools} =
+      Enum.reduce(log, {[], []}, fn entry, {entries, tools} ->
+        case entry do
+          {:tool_start, _, _, _} -> {entries, [entry | tools]}
+          {:tool_start, _, _} -> {entries, [entry | tools]}
+          {:tool_done, _, _, _} -> {entries, [entry | tools]}
+          _ -> {[entry | entries], tools}
+        end
+      end)
 
-  defp append_tool_chunk([], e), do: [{:tools, [e]}]
-
-  defp append_tool_chunk(acc, e) do
-    case List.last(acc) do
-      {:tools, chunk} ->
-        List.replace_at(acc, length(acc) - 1, {:tools, chunk ++ [e]})
-
-      _ ->
-        acc ++ [{:tools, [e]}]
-    end
+    # One activity group per user turn, including calls separated by assistant text.
+    # Answers stay first so completed deliverables are immediately readable.
+    Enum.reverse(entries) ++ if(tools == [], do: [], else: [{:tools, Enum.reverse(tools)}])
   end
 
   defp build_user_edit_meta(messages) when is_list(messages) do
@@ -1822,6 +1997,12 @@ defmodule FluxClawWeb.ChatLive do
 
   defp encode_log_entry({:reasoning, c}), do: %{"k" => "r", "c" => c}
 
+  defp encode_log_entry({:stopped, id}), do: %{"k" => "stopped", "i" => to_string(id)}
+
+  defp encode_log_entry({:tool_start, id, n, a}) do
+    %{"k" => "ts", "id" => id, "n" => n, "a" => json_safe_for_snapshot(a)}
+  end
+
   defp encode_log_entry({:tool_start, n, a}) do
     %{"k" => "ts", "n" => to_string(n), "a" => json_safe_for_snapshot(a)}
   end
@@ -1905,10 +2086,17 @@ defmodule FluxClawWeb.ChatLive do
       "r" ->
         [{:reasoning, Map.get(m, "c") || Map.get(m, :c) || ""}]
 
+      "stopped" ->
+        [{:stopped, Map.get(m, "i") || Map.get(m, :i)}]
+
       "ts" ->
         n = Map.get(m, "n") || Map.get(m, :n) || "tool"
         a = Map.get(m, "a") || Map.get(m, :a) || %{}
-        [{:tool_start, n, a}]
+
+        case Map.get(m, "id") do
+          nil -> [{:tool_start, n, a}]
+          id -> [{:tool_start, id, n, a}]
+        end
 
       "td" ->
         id = Map.get(m, "id") || Map.get(m, :id) || "call"
@@ -1972,14 +2160,7 @@ defmodule FluxClawWeb.ChatLive do
     "left: #{left}px; top: #{t}px; transform: translateY(calc(-100% - 6px));"
   end
 
-  defp md_html(text) when is_binary(text) and text != "" do
-    Earmark.as_html!(text, gfm: true, breaks: true)
-  rescue
-    _ ->
-      text |> Plug.HTML.html_escape() |> Phoenix.HTML.safe_to_string()
-  end
-
-  defp md_html(_), do: ""
+  defp md_html(text), do: FluxClawWeb.Markdown.render(text)
 
   @impl true
   def render(assigns) do
@@ -1987,7 +2168,9 @@ defmodule FluxClawWeb.ChatLive do
     <Layouts.app flash={@flash} current_scope={nil} variant={:bare}>
       <div
         id="app-frame"
-        class="flex h-dvh overflow-hidden bg-zinc-100 text-zinc-900 [[data-theme=dark]_&]:bg-zinc-950 [[data-theme=dark]_&]:text-zinc-100"
+        class="workbench flex h-dvh overflow-hidden"
+        phx-window-keydown="close_drawers"
+        phx-key="Escape"
       >
         <div
           :if={@sidebar_open}
@@ -2000,7 +2183,7 @@ defmodule FluxClawWeb.ChatLive do
           class={[
             "fixed lg:static inset-y-0 left-0 z-50 flex flex-col border-r border-zinc-200/80 bg-white transition-transform duration-200 [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900 lg:translate-x-0",
             if(@sidebar_open, do: "translate-x-0", else: "-translate-x-full"),
-            if(@sidebar_collapsed, do: "w-14", else: "w-[min(17.5rem,88vw)] lg:w-[17.5rem]")
+            if(@sidebar_collapsed, do: "w-14", else: "w-[min(248px,88vw)] lg:w-[248px]")
           ]}
           id="sidebar-root"
         >
@@ -2021,7 +2204,7 @@ defmodule FluxClawWeb.ChatLive do
                 FluxClaw
               </span>
               <span class="ml-auto text-[10px] font-medium uppercase tracking-wider text-zinc-400">
-                agent
+                Workbench
               </span>
             <% end %>
           </div>
@@ -2070,6 +2253,10 @@ defmodule FluxClawWeb.ChatLive do
             </div>
           <% else %>
             <div class="flex flex-1 flex-col min-h-0 overflow-hidden">
+              <button id="new-task" type="button" phx-click="new_chat" class="wb-new-task">
+                <.icon name="hero-plus" class="size-4" /> 新建对话
+                <span class="ml-auto text-[10px] opacity-60">NEW TASK</span>
+              </button>
               <section class="flex flex-col min-h-0 border-b border-zinc-100 [[data-theme=dark]_&]:border-zinc-800 shrink-0 max-h-[32vh]">
                 <div class="flex items-center gap-1 px-2 py-2 shrink-0">
                   <button
@@ -2127,7 +2314,7 @@ defmodule FluxClawWeb.ChatLive do
                 </div>
               </section>
 
-              <section class="flex flex-col min-h-0 border-b border-zinc-100 [[data-theme=dark]_&]:border-zinc-800 flex-1 max-h-[34vh]">
+              <section class="flex flex-col min-h-0 border-b border-zinc-100 [[data-theme=dark]_&]:border-zinc-800 flex-1">
                 <div class="flex items-center gap-1 px-2 py-2 shrink-0">
                   <button
                     type="button"
@@ -2190,100 +2377,16 @@ defmodule FluxClawWeb.ChatLive do
                 </div>
               </section>
 
-              <section class="flex flex-col min-h-0 flex-1 max-h-[34vh]">
-                <div class="flex items-center gap-1 px-2 py-2 shrink-0">
-                  <button
-                    type="button"
-                    phx-click="toggle_nav"
-                    phx-value-section="skills"
-                    class="flex flex-1 min-w-0 items-center gap-2 text-left rounded-lg hover:bg-zinc-50 [[data-theme=dark]_&]:hover:bg-zinc-800/60 px-1 py-0.5"
-                    id="nav-toggle-skills"
-                  >
-                    <.icon
-                      name="hero-chevron-right"
-                      class={[
-                        "size-4 text-zinc-400 shrink-0 transition-transform",
-                        @nav_open["skills"] && "rotate-90"
-                      ]}
-                    />
-                    <span class="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 truncate">
-                      技能 (L3)
-                    </span>
-                  </button>
-                  <div class="flex items-center gap-1 shrink-0">
-                    <button
-                      type="button"
-                      phx-click="open_skill_import"
-                      class="text-xs text-sky-600 hover:text-sky-700 font-medium px-1"
-                    >
-                      导入
-                    </button>
-                    <button
-                      type="button"
-                      phx-click="open_skill_editor_new"
-                      class="text-xs text-emerald-600 hover:text-emerald-700 font-medium px-1"
-                    >
-                      + 新建
-                    </button>
-                  </div>
-                </div>
-                <div :if={@nav_open["skills"]} class="flex-1 min-h-0 overflow-y-auto px-2 pb-2">
-                  <%= for sk <- @skills_sidebar do %>
-                    <div class="group flex items-start gap-0.5 py-1 border-b border-zinc-100 last:border-0 [[data-theme=dark]_&]:border-zinc-800">
-                      <span class="truncate flex-1 text-xs" title={sk.title}>{sk.title}</span>
-                      <button
-                        type="button"
-                        id={"sidebar-ctx-skill-#{sk.id}"}
-                        phx-hook="SidebarContextMenu"
-                        data-menu-type="skill"
-                        data-menu-id={sk.id}
-                        class="p-1 rounded text-zinc-500 hover:bg-zinc-200 [[data-theme=dark]_&]:hover:bg-zinc-700 shrink-0"
-                        aria-label="菜单"
-                      >
-                        <.icon name="hero-ellipsis-vertical" class="size-3.5" />
-                      </button>
-                    </div>
-                  <% end %>
-                </div>
-              </section>
-
-              <section class="flex flex-col min-h-0 flex-1 max-h-[28vh] border-t border-zinc-100 [[data-theme=dark]_&]:border-zinc-800">
-                <div class="flex items-center gap-1 px-2 py-2 shrink-0">
-                  <button
-                    type="button"
-                    phx-click="toggle_nav"
-                    phx-value-section="memory"
-                    class="flex flex-1 min-w-0 items-center gap-2 text-left rounded-lg hover:bg-zinc-50 [[data-theme=dark]_&]:hover:bg-zinc-800/60 px-1 py-0.5"
-                    id="nav-toggle-memory"
-                  >
-                    <.icon
-                      name="hero-chevron-right"
-                      class={[
-                        "size-4 text-zinc-400 shrink-0 transition-transform",
-                        @nav_open["memory"] && "rotate-90"
-                      ]}
-                    />
-                    <span class="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 truncate">
-                      Memory (.md)
-                    </span>
-                  </button>
-                </div>
-                <div :if={@nav_open["memory"]} class="flex-1 min-h-0 overflow-y-auto px-2 pb-2">
-                  <%= for f <- @memory_doc_files do %>
-                    <div class="py-1 border-b border-zinc-100 last:border-0 [[data-theme=dark]_&]:border-zinc-800">
-                      <span
-                        class="text-[11px] text-zinc-600 [[data-theme=dark]_&]:text-zinc-400 truncate block"
-                        title={f.path}
-                      >
-                        {f.name}
-                      </span>
-                    </div>
-                  <% end %>
-                  <%= if @memory_doc_files == [] do %>
-                    <p class="text-[11px] text-zinc-400 px-1 py-2">memory 目录下暂无文档</p>
-                  <% end %>
-                </div>
-              </section>
+              <button
+                id="project-resources"
+                type="button"
+                phx-click="set_right_tab"
+                phx-value-tab="memory"
+                class="wb-resource-link"
+              >
+                <.icon name="hero-square-3-stack-3d" class="size-4" /> 项目资源与技能
+                <.icon name="hero-chevron-right" class="ml-auto size-3" />
+              </button>
             </div>
           <% end %>
 
@@ -2495,10 +2598,13 @@ defmodule FluxClawWeb.ChatLive do
         <main class="relative flex flex-1 flex-col min-w-0 min-h-0 bg-white [[data-theme=dark]_&]:bg-zinc-950">
           <header class="flex h-12 items-center gap-1.5 border-b border-zinc-200/80 px-3 shrink-0 [[data-theme=dark]_&]:border-zinc-800">
             <button
+              id="navigation-toggle"
               type="button"
               phx-click="toggle_sidebar"
               class="rounded-lg p-2 text-zinc-600 hover:bg-zinc-100 lg:hidden [[data-theme=dark]_&]:text-zinc-300 [[data-theme=dark]_&]:hover:bg-zinc-800"
               aria-label="菜单"
+              aria-expanded={to_string(@sidebar_open)}
+              aria-controls="sidebar-root"
             >
               <.icon name="hero-bars-3" class="size-5" />
             </button>
@@ -2520,59 +2626,21 @@ defmodule FluxClawWeb.ChatLive do
               />
             </button>
             <div class="flex-1 min-w-0 px-1">
-              <h1 class="text-[15px] font-semibold truncate">
-                {(@session && @session.title) || (@project && @project.title) || "选择项目或对话"}
+              <p class="wb-breadcrumb">{(@project && @project.title) || "工作空间"} <span>/</span></p>
+              <h1 class="text-[14px] font-medium truncate">
+                {(@session && @session.title) || "新任务"}
               </h1>
             </div>
             <div class="flex items-center gap-1 shrink-0">
               <button
                 type="button"
-                phx-click="set_right_tab"
-                phx-value-tab="timeline"
-                class={[
-                  "rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors",
-                  @right_tab == :timeline &&
-                    "bg-zinc-200/90 text-zinc-800 [[data-theme=dark]_&]:bg-zinc-800 [[data-theme=dark]_&]:text-zinc-100",
-                  @right_tab != :timeline &&
-                    "text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                ]}
-              >
-                轨迹
-              </button>
-              <button
-                type="button"
-                phx-click="set_right_tab"
-                phx-value-tab="memory"
-                class={[
-                  "rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors",
-                  @right_tab == :memory &&
-                    "bg-zinc-200/90 text-zinc-800 [[data-theme=dark]_&]:bg-zinc-800 [[data-theme=dark]_&]:text-zinc-100",
-                  @right_tab != :memory &&
-                    "text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                ]}
-              >
-                记忆
-              </button>
-              <button
-                type="button"
-                phx-click="set_right_tab"
-                phx-value-tab="plugins"
-                class={[
-                  "rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors",
-                  @right_tab == :plugins &&
-                    "bg-zinc-200/90 text-zinc-800 [[data-theme=dark]_&]:bg-zinc-800 [[data-theme=dark]_&]:text-zinc-100",
-                  @right_tab != :plugins &&
-                    "text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
-                ]}
-              >
-                插件
-              </button>
-              <button
-                type="button"
                 phx-click="toggle_right"
-                class="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
+                class="flex items-center rounded-lg p-2 text-zinc-500 hover:bg-zinc-100 [[data-theme=dark]_&]:hover:bg-zinc-800"
                 title={if(@right_open, do: "隐藏面板", else: "显示面板")}
+                id="details-toggle"
                 aria-label="切换右侧面板"
+                aria-expanded={to_string(@right_open)}
+                aria-controls="sidebar-right"
               >
                 <.icon
                   name={
@@ -2583,36 +2651,10 @@ defmodule FluxClawWeb.ChatLive do
                   }
                   class="size-5"
                 />
+                <span class="ml-1 text-xs">详情</span>
               </button>
             </div>
           </header>
-
-          <%= if @skill_proposal do %>
-            <div class="shrink-0 border-b border-amber-200/80 bg-amber-50 px-4 py-3 text-sm [[data-theme=dark]_&]:border-amber-900/50 [[data-theme=dark]_&]:bg-amber-950/40">
-              <p class="font-medium text-amber-900 [[data-theme=dark]_&]:text-amber-200">
-                建议保存新技能（需确认）
-              </p>
-              <p class="text-zinc-700 mt-1 truncate [[data-theme=dark]_&]:text-zinc-300">
-                {@skill_proposal.title}
-              </p>
-              <div class="mt-2 flex gap-2">
-                <button
-                  type="button"
-                  phx-click="accept_skill_proposal"
-                  class="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
-                >
-                  接受并保存
-                </button>
-                <button
-                  type="button"
-                  phx-click="dismiss_skill_proposal"
-                  class="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs [[data-theme=dark]_&]:border-zinc-600"
-                >
-                  忽略
-                </button>
-              </div>
-            </div>
-          <% end %>
 
           <%= if @move_target do %>
             <.move_project_modal
@@ -2703,202 +2745,161 @@ defmodule FluxClawWeb.ChatLive do
             </div>
           <% end %>
 
-          <%= if @session do %>
-            <div
-              id="chat-scroll"
-              phx-hook="ChatScroll"
-              class="flex-1 overflow-y-auto px-3 py-6 space-y-5 scroll-smooth mx-auto w-full max-w-[46.75rem]"
-              data-external-link-event="external_link_click"
-            >
-              <%= for slice <- chat_slices(@log, @user_edit_meta, @user_variant_idx) do %>
-                <%= case slice do %>
-                  <% {:plain, grouped} -> %>
-                    <%= for entry <- grouped do %>
-                      <%= case entry do %>
-                        <% {:tools, items} -> %>
-                          <.tools_flow_block items={items} />
-                        <% _ -> %>
-                          <.chat_bubble entry={entry} />
-                      <% end %>
-                    <% end %>
-                  <% {:user_turn, msg_id, display_text, versions, vidx, grouped_follow} -> %>
-                    <.user_message_block
-                      msg_id={msg_id || ""}
-                      content={display_text}
-                      versions={versions}
-                      variant_idx={vidx}
-                      editing_user={@editing_user_msg}
-                      follow_entries={grouped_follow}
-                    />
-                <% end %>
-              <% end %>
-
-              <%= if @draft_reasoning && @draft_reasoning != "" do %>
-                <details class="group rounded-xl border border-violet-200/80 bg-violet-50/90 [[data-theme=dark]_&]:border-violet-900/50 [[data-theme=dark]_&]:bg-violet-950/30">
-                  <summary class="cursor-pointer select-none list-none flex items-center gap-2 px-4 py-2.5 text-xs font-medium text-violet-700 [[data-theme=dark]_&]:text-violet-300 marker:content-none">
-                    <.icon
-                      name="hero-chevron-right"
-                      class="size-4 shrink-0 transition-transform group-open:rotate-90"
-                    />
-                    <.icon name="hero-sparkles" class="size-4" /> 思考中…（点击展开）
-                  </summary>
-                  <div class="chat-md border-t border-violet-200/60 px-4 py-3 text-sm text-zinc-800 [[data-theme=dark]_&]:border-violet-900/40 [[data-theme=dark]_&]:text-zinc-200">
-                    {raw(md_html(@draft_reasoning))}
-                  </div>
-                </details>
-              <% end %>
-
-              <%= if @draft_assistant && @draft_assistant != "" do %>
-                <div class="flex justify-start">
-                  <div class="chat-md w-full rounded-2xl border border-zinc-200 bg-zinc-50 px-4 py-3 [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900/60">
-                    <div class="flex items-center gap-2 text-xs text-zinc-500 mb-2">
-                      <span class="inline-block size-2 rounded-full bg-emerald-500 animate-pulse">
-                      </span>
-                      正在输出…
-                    </div>
-                    <div class="chat-md text-[15px] leading-relaxed">
-                      {raw(md_html(@draft_assistant))}
-                    </div>
-                  </div>
-                </div>
-              <% end %>
-            </div>
-
-            <%= if @pending_ask do %>
-              <div class="shrink-0 border-t border-amber-300/50 bg-amber-50/90 px-4 py-3 [[data-theme=dark]_&]:border-amber-900/40 [[data-theme=dark]_&]:bg-amber-950/30">
-                <p class="text-sm font-medium">需要你的确认</p>
-                <p class="text-sm mt-1 whitespace-pre-wrap text-zinc-700 [[data-theme=dark]_&]:text-zinc-300">
-                  {@pending_ask.question}
-                </p>
-                <form
-                  id="ask-user-form"
-                  phx-submit="answer_user"
-                  class="mt-3 flex flex-col sm:flex-row gap-2"
-                >
-                  <input type="hidden" name="ref" value={@pending_ask.ref} />
-                  <textarea
-                    name="text"
-                    id="ask-user-text"
-                    rows="2"
-                    class="flex-1 rounded-xl border border-zinc-300 bg-white px-3 py-2 text-sm min-h-[2.5rem] [[data-theme=dark]_&]:border-zinc-600 [[data-theme=dark]_&]:bg-zinc-900"
-                    placeholder="输入回复…"
-                  ></textarea>
+          <div
+            id="chat-scroll"
+            phx-hook="ChatScroll"
+            class="wb-chat-scroll"
+            data-external-link-event="external_link_click"
+          >
+            <div class="wb-conversation">
+              <section :if={@log == []} id="workbench-welcome" class="wb-welcome">
+                <div class="wb-eyebrow"><span class="wb-status-dot"></span> FLUXCLAW WORKBENCH</div>
+                <h2>想完成什么任务？</h2>
+                <p>从一个想法，到一份可以交付的成果。<br />一起研究、编写、构建，让工作向前一步。</p>
+                <div class="wb-examples">
                   <button
-                    type="submit"
-                    class="rounded-xl bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700 shrink-0"
-                  >
-                    提交
-                  </button>
-                </form>
-              </div>
-            <% end %>
-
-            <%= if @pending_diff do %>
-              <.diff_review_block pending_diff={@pending_diff} />
-            <% end %>
-
-            <div class="shrink-0 border-t border-zinc-200/80 p-3 bg-white [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-950">
-              <form
-                id="chat-send-form"
-                phx-submit="send"
-                class="mx-auto flex max-w-[46.75rem] gap-2 items-end w-full"
-              >
-                <div class="flex-1 relative">
-                  <textarea
-                    id="chat-composer"
-                    name="text"
-                    rows="1"
-                    phx-hook="ChatComposer"
-                    class="w-full min-h-[2.75rem] max-h-[12rem] resize-none rounded-2xl border border-zinc-300 bg-zinc-50 px-4 py-3 pr-12 text-[15px] leading-relaxed [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:bg-zinc-900"
-                    placeholder="按 Enter 发送，Shift+Enter 换行"
-                    autocomplete="off"
-                  ></textarea>
-                </div>
-                <%= if @agent_busy do %>
-                  <button
+                    id="example-research"
                     type="button"
-                    phx-click="stop_agent"
-                    id="chat-stop-btn"
-                    class="rounded-2xl bg-red-600 p-3 text-white shadow-sm hover:bg-red-700 transition-colors shrink-0"
-                    title="停止生成"
-                    aria-label="停止生成"
+                    phx-click="fill_example"
+                    phx-value-text="搜索这个主题的可靠资料，注明来源并整理研究结论："
+                    class="wb-example"
                   >
-                    <.icon name="hero-stop-circle-solid" class="size-5" />
+                    <.icon name="hero-globe-alt" class="size-5" /><strong>研究一个主题</strong><span>搜索资料，交叉核实，整理结论</span>
                   </button>
-                <% else %>
                   <button
-                    type="submit"
-                    id="chat-send-btn"
-                    class="rounded-2xl bg-emerald-600 p-3 text-white shadow-sm hover:bg-emerald-700 transition-colors shrink-0"
-                    title="发送"
-                    aria-label="发送"
+                    id="example-build"
+                    type="button"
+                    phx-click="fill_example"
+                    phx-value-text="请帮我实现这个功能，先制定计划，再编写代码并验证："
+                    class="wb-example"
                   >
-                    <.icon name="hero-paper-airplane-solid" class="size-5" />
+                    <.icon name="hero-command-line" class="size-5" /><strong>构建与验证</strong><span>从任务计划到代码与执行结果</span>
                   </button>
-                <% end %>
-              </form>
-            </div>
-          <% else %>
-            <%= if @project do %>
-              <div class="flex flex-1 flex-col min-h-0 justify-end">
-                <div class="shrink-0 px-4 pt-6 pb-2 text-center">
-                  <p class="text-sm text-zinc-600 [[data-theme=dark]_&]:text-zinc-400 max-w-lg mx-auto">
-                    在下方输入首条消息将自动创建对话，标题由首句生成。右侧面板可查看轨迹、记忆与插件。
-                  </p>
-                </div>
-                <div class="shrink-0 border-t border-zinc-200/80 p-3 bg-white [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-950">
-                  <form
-                    id="chat-send-form-project"
-                    phx-submit="send"
-                    class="mx-auto flex max-w-[46.75rem] gap-2 items-end w-full"
+                  <button
+                    id="example-organize"
+                    type="button"
+                    phx-click="fill_example"
+                    phx-value-text="把下面的内容整理成清晰的行动清单，并保存为 Markdown 文件："
+                    class="wb-example"
                   >
-                    <div class="flex-1 relative">
-                      <textarea
-                        id="chat-composer-project"
-                        name="text"
-                        rows="1"
-                        phx-hook="ChatComposer"
-                        class="w-full min-h-[2.75rem] max-h-[12rem] resize-none rounded-2xl border border-zinc-300 bg-zinc-50 px-4 py-3 pr-12 text-[15px] leading-relaxed [[data-theme=dark]_&]:border-zinc-700 [[data-theme=dark]_&]:bg-zinc-900"
-                        placeholder="按 Enter 发送首条消息，Shift+Enter 换行"
-                        autocomplete="off"
-                      ></textarea>
-                    </div>
-                    <%= if @agent_busy do %>
-                      <button
-                        type="button"
-                        phx-click="stop_agent"
-                        id="chat-stop-btn-project"
-                        class="rounded-2xl bg-red-600 p-3 text-white shadow-sm hover:bg-red-700 transition-colors shrink-0"
-                        title="停止生成"
-                        aria-label="停止生成"
-                      >
-                        <.icon name="hero-stop-circle-solid" class="size-5" />
-                      </button>
-                    <% else %>
-                      <button
-                        type="submit"
-                        id="chat-send-btn-project"
-                        class="rounded-2xl bg-emerald-600 p-3 text-white shadow-sm hover:bg-emerald-700 transition-colors shrink-0"
-                        title="发送"
-                        aria-label="发送"
-                      >
-                        <.icon name="hero-paper-airplane-solid" class="size-5" />
-                      </button>
-                    <% end %>
-                  </form>
+                    <.icon name="hero-document-text" class="size-5" /><strong>整理成可用成果</strong><span>提炼重点，生成文档与行动清单</span>
+                  </button>
                 </div>
+              </section>
+              <div id="conversation-turns" phx-update="stream">
+                <article :for={{dom_id, turn} <- @streams.turns} id={dom_id} class="wb-turn">
+                  <%= case turn.slice do %>
+                    <% {:plain, grouped} -> %>
+                      <%= for entry <- grouped do %>
+                        <%= case entry do %>
+                          <% {:tools, items} -> %>
+                            <.tools_flow_block items={items} />
+                          <% _ -> %>
+                            <.chat_bubble entry={entry} />
+                        <% end %>
+                      <% end %>
+                    <% {:user_turn, msg_id, display_text, versions, vidx, grouped_follow} -> %>
+                      <.user_message_block
+                        msg_id={msg_id || ""}
+                        content={display_text}
+                        versions={versions}
+                        variant_idx={vidx}
+                        editing_user={@editing_user_msg}
+                        follow_entries={grouped_follow}
+                      />
+                  <% end %>
+                </article>
               </div>
-            <% else %>
-              <div class="flex flex-1 flex-col items-center justify-center p-8 text-center text-zinc-500">
-                <p class="text-lg font-medium text-zinc-700 [[data-theme=dark]_&]:text-zinc-300 mb-2">
-                  选择项目
-                </p>
-                <p class="text-sm max-w-md">
-                  请先在侧栏选择或新建项目。
-                </p>
+              <details
+                :if={@draft_reasoning not in [nil, ""]}
+                id="model-reasoning"
+                class="wb-reasoning"
+              >
+                <summary>模型推理 · 点击查看模型返回的内容</summary>
+                <div class="chat-md">{raw(md_html(@draft_reasoning))}</div>
+              </details>
+              <div
+                :if={@draft_assistant not in [nil, ""]}
+                id="streaming-answer"
+                class="wb-assistant chat-md"
+              >
+                {raw(md_html(@draft_assistant))}
               </div>
-            <% end %>
-          <% end %>
+              <div
+                :if={@agent_busy || @run_status}
+                id="agent-status"
+                class="wb-run-status"
+                role="status"
+                aria-live="polite"
+              >
+                <span :if={@agent_busy} class="wb-status-dot animate-pulse"></span>
+                {if(@agent_busy, do: "正在处理任务…", else: @run_status)}
+              </div>
+              <section :if={@pending_ask} id="agent-question" class="wb-action-card">
+                <div class="wb-eyebrow">
+                  <.icon name="hero-chat-bubble-left-right" class="size-4" /> 等待你的回复
+                </div>
+                <p>{@pending_ask.question}</p>
+                <.form for={@answer_form} id="ask-user-form" phx-submit="answer_user">
+                  <.input type="hidden" name="ref" value={@pending_ask.ref} />
+                  <.input
+                    field={@answer_form[:text]}
+                    id="ask-user-text"
+                    type="textarea"
+                    rows="2"
+                    class="wb-answer-input"
+                    placeholder="输入回复，继续任务…"
+                    required
+                  />
+                  <button id="answer-submit" type="submit" class="wb-primary">
+                    回复并继续 <.icon name="hero-arrow-right" class="size-4" />
+                  </button>
+                </.form>
+              </section>
+              <.diff_review_block :if={@pending_diff} pending_diff={@pending_diff} />
+            </div>
+          </div>
+          <button id="jump-to-latest" type="button" class="wb-jump hidden" aria-label="回到最新">
+            <.icon name="hero-arrow-down" class="size-4" /> 回到最新
+          </button>
+          <section
+            :if={@skill_proposal}
+            id="skill-proposal"
+            class="wb-action-card mx-auto w-full max-w-[760px] mb-3"
+          >
+            <h3 class="font-semibold">将这次经验保存为技能</h3>
+            <p class="mt-2 text-sm">{@skill_proposal.title}</p>
+            <details class="mt-2 text-xs">
+              <summary>预览技能正文</summary>
+              <pre class="whitespace-pre-wrap max-h-48 overflow-auto mt-2">{Map.get(@skill_proposal, :body, "")}</pre>
+            </details>
+            <div class="mt-3 flex gap-2">
+              <button
+                id="save-proposed-skill"
+                type="button"
+                phx-click="accept_skill_proposal"
+                class="wb-secondary"
+              >
+                保存技能
+              </button>
+              <button
+                id="dismiss-proposed-skill"
+                type="button"
+                phx-click="dismiss_skill_proposal"
+                class="wb-secondary"
+              >
+                忽略
+              </button>
+            </div>
+          </section>
+          <.workbench_composer
+            form={@composer_form}
+            agent_busy={@agent_busy}
+            pending_ask={@pending_ask}
+            session_id={@session && @session.id}
+            project_id={@project && @project.id}
+            settings={@settings_form}
+          />
         </main>
 
         <div
@@ -2913,7 +2914,7 @@ defmodule FluxClawWeb.ChatLive do
           class={[
             "flex-col border-l border-zinc-200/80 bg-white [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900",
             "max-xl:fixed max-xl:inset-y-0 max-xl:right-0 max-xl:z-50 max-xl:w-[min(24rem,92vw)] max-xl:shadow-2xl",
-            "xl:relative xl:flex xl:w-[24rem] xl:shrink-0",
+            "xl:relative xl:w-[320px] xl:shrink-0",
             if(@right_open, do: "flex translate-x-0", else: "max-xl:hidden xl:hidden")
           ]}
         >
@@ -2931,10 +2932,83 @@ defmodule FluxClawWeb.ChatLive do
             </button>
           </div>
 
+          <nav class="wb-detail-tabs" aria-label="详情分类">
+            <button
+              :for={
+                {tab, label} <- [
+                  {"memory", "项目资源"},
+                  {"timeline", "运行轨迹"},
+                  {"plugins", "工具集成"},
+                  {"files", "文件"}
+                ]
+              }
+              id={"detail-tab-#{tab}"}
+              type="button"
+              phx-click="set_right_tab"
+              phx-value-tab={tab}
+              aria-selected={to_string(Atom.to_string(@right_tab) == tab)}
+            >
+              {label}
+            </button>
+          </nav>
           <div class="flex-1 min-h-0 overflow-y-auto p-3">
             <%= case @right_tab do %>
               <% :plugins -> %>
+                <.native_integrations form={@integration_form} />
                 <.plugin_panel plugins_info={@plugins_info} />
+              <% :files -> %>
+                <div id="artifact-panel" class="space-y-4">
+                  <p class="text-sm text-zinc-500">当前会话的实际文件 · 最多展示 150 项</p>
+                  <button
+                    id="refresh-artifacts"
+                    type="button"
+                    phx-click="refresh_artifacts"
+                    class="wb-secondary"
+                  >
+                    刷新文件
+                  </button>
+                  <.form
+                    :if={@session}
+                    for={@attachment_form}
+                    id="attachment-form"
+                    phx-change="validate_upload"
+                    phx-submit="upload_files"
+                    class="space-y-3"
+                  >
+                    <label for={@uploads.attachments.ref} class="text-sm">添加附件（每个不超过 8 MB）</label>
+                    <.live_file_input upload={@uploads.attachments} class="w-full text-xs" />
+                    <div :for={entry <- @uploads.attachments.entries} class="text-xs break-all">
+                      {entry.client_name} · {entry.progress}%<span
+                        :for={error <- upload_errors(@uploads.attachments, entry)}
+                        class="block text-red-600"
+                      >{error}</span>
+                    </div>
+                    <p
+                      :for={error <- upload_errors(@uploads.attachments)}
+                      class="text-xs text-red-600"
+                    >
+                      {error}
+                    </p>
+                    <button id="upload-attachments" type="submit" class="wb-secondary">保存附件</button>
+                  </.form>
+                  <div id="artifact-files" phx-update="stream" class="space-y-2">
+                    <p id="artifacts-empty" class="hidden only:block text-sm text-zinc-500">
+                      点击刷新查看文件。先创建任务即可上传附件。
+                    </p>
+                    <article :for={{id, file} <- @streams.artifacts} id={id} class="wb-file-card">
+                      <p class="break-all text-sm font-medium">{file.path}</p>
+                      <p class="text-xs text-zinc-500">{file.size} bytes</p>
+                      <div :if={@session} class="mt-2 flex gap-3 text-xs">
+                        <a href={artifact_url(@session.id, file.path)} target="_blank" rel="noopener">
+                          预览
+                        </a>
+                        <a href={artifact_url(@session.id, file.path) <> "?download=1"} download>
+                          下载
+                        </a>
+                      </div>
+                    </article>
+                  </div>
+                </div>
               <% :memory -> %>
                 <.memory_panel
                   skills={@skills_sidebar}
@@ -2957,8 +3031,81 @@ defmodule FluxClawWeb.ChatLive do
     """
   end
 
-  defp right_tab_title(:plugins), do: "插件管理"
-  defp right_tab_title(:memory), do: "记忆与技能"
+  attr :form, :any, required: true
+  attr :agent_busy, :boolean, required: true
+  attr :pending_ask, :any, required: true
+  attr :session_id, :any, default: nil
+  attr :project_id, :any, default: nil
+  attr :settings, :map, required: true
+
+  defp workbench_composer(assigns) do
+    ~H"""
+    <div class="wb-composer-area">
+      <div :if={@settings["api_key"] in [nil, ""]} id="model-setup-notice" class="wb-model-notice">
+        配置模型后即可开始任务。<button type="button" id="open-model-settings" phx-click="toggle_settings">打开模型设置 <.icon
+            name="hero-arrow-up-right"
+            class="size-3"
+          /></button>
+      </div>
+      <div :if={@pending_ask} class="wb-composer-hint">等待你的回复 · 当前草稿已保留</div>
+      <.form for={@form} id="chat-send-form" phx-submit="send" class="wb-composer">
+        <.input
+          field={@form[:text]}
+          type="textarea"
+          id={"chat-composer-" <> (@session_id || @project_id || "home")}
+          rows="2"
+          class="wb-composer-input"
+          phx-hook="ChatComposer"
+          phx-update="ignore"
+          data-draft-key={@session_id || @project_id || "home"}
+          placeholder="描述任务，或继续一个想法…"
+          autocomplete="off"
+        />
+        <div class="wb-composer-toolbar">
+          <button
+            id="composer-model"
+            type="button"
+            phx-click="toggle_settings"
+            class="wb-model-picker"
+          >
+            <.icon name="hero-cube-transparent" class="size-4" />{@settings["model"] || "配置模型"}<.icon
+              name="hero-chevron-down"
+              class="size-3"
+            />
+          </button>
+          <span class="wb-composer-shortcut">Enter 发送 · Shift+Enter 换行</span>
+          <button
+            :if={@agent_busy}
+            type="button"
+            id="chat-stop-btn"
+            phx-click="stop_agent"
+            class="wb-send"
+            aria-label="停止当前任务"
+            title="停止当前任务"
+          >
+            <.icon name="hero-stop-solid" class="size-4" />
+          </button>
+          <button
+            :if={!@agent_busy}
+            type="submit"
+            id="chat-send-btn"
+            disabled={@pending_ask != nil}
+            class="wb-send"
+            aria-label="发送任务"
+            title="发送任务"
+          >
+            <.icon name="hero-arrow-up" class="size-5" />
+          </button>
+        </div>
+      </.form>
+      <p class="wb-composer-footnote">FluxClaw 可以使用工具完成任务。请核实关键结果。</p>
+    </div>
+    """
+  end
+
+  defp right_tab_title(:files), do: "附件与产物"
+  defp right_tab_title(:plugins), do: "工具集成"
+  defp right_tab_title(:memory), do: "项目资源"
   defp right_tab_title(:timeline), do: "运行轨迹"
 
   attr :pending_diff, :map, required: true
@@ -3018,6 +3165,51 @@ defmodule FluxClawWeb.ChatLive do
         </p>
       </div>
     </div>
+    """
+  end
+
+  defp artifact_url(sid, path),
+    do:
+      "/artifacts/" <>
+        sid <>
+        "/" <>
+        Enum.map_join(Path.split(path), "/", &URI.encode(&1, fn c -> URI.char_unreserved?(c) end))
+
+  attr :form, :any, required: true
+
+  defp native_integrations(assigns) do
+    ~H"""
+    <section id="native-integrations" class="wb-integration space-y-3 mb-5">
+      <h3 class="font-semibold">原生 LLM 工具</h3>
+      <p class="text-xs text-zinc-500">
+        AgentSearch 检索知识索引；Harness² 使用当前模型改进文本任务，复用会话内的经验。配置后由模型直接调用。
+      </p>
+      <.form for={@form} id="integration-settings" phx-submit="save_integrations" class="space-y-3">
+        <.input
+          field={@form[:search_url]}
+          label="AgentSearch 服务地址"
+          placeholder="http://127.0.0.1:8000"
+        />
+        <.input
+          field={@form[:search_mode]}
+          type="select"
+          label="服务协议"
+          options={[{"自托管 AgentSearch", "local"}, {"SciPhi 托管接口", "sciphi"}]}
+        />
+        <.input
+          field={@form[:search_key]}
+          type="password"
+          label="搜索 API Key（留空保留）"
+          autocomplete="new-password"
+        />
+        <p class="text-xs text-zinc-500">搜索需要独立部署、导入数据的 AgentSearch 服务；空地址表示未配置。环境变量优先于此处设置。</p>
+        <.input field={@form[:python]} label="Python 3.12 / 3.13 可执行文件" />
+        <p class="text-xs text-zinc-500">
+          Harness² 源码已内置，无需外部 CLI。可让 Agent 调用 harness2_optimize 的 demo 操作验证环境。
+        </p>
+        <button id="save-integrations" type="submit" class="wb-secondary">保存工具配置</button>
+      </.form>
+    </section>
     """
   end
 
@@ -3131,7 +3323,20 @@ defmodule FluxClawWeb.ChatLive do
 
   defp memory_panel(assigns) do
     ~H"""
-    <div class="space-y-4">
+    <div id="memory-panel" class="space-y-4">
+      <div class="flex gap-2">
+        <button id="add-skill" type="button" phx-click="open_skill_editor_new" class="wb-secondary">
+          新建技能
+        </button>
+        <button
+          id="import-skill"
+          type="button"
+          phx-click="open_skill_import"
+          class="wb-secondary"
+        >
+          导入技能
+        </button>
+      </div>
       <section>
         <p class="text-xs font-semibold uppercase tracking-wider text-zinc-500">检查点 (L1/L2)</p>
         <%= if @checkpoints == [] do %>
@@ -3630,20 +3835,50 @@ defmodule FluxClawWeb.ChatLive do
   attr :items, :list, required: true
 
   def tools_flow_block(assigns) do
-    assigns = assign(assigns, :count, length(assigns.items))
+    rows = FluxClaw.ToolActivity.rows(assigns.items)
+
+    assigns =
+      assigns
+      |> assign(:rows, rows)
+      |> assign(:completed, Enum.count(rows, &(&1.state != :running)))
 
     ~H"""
-    <details class="group rounded-xl border border-zinc-200 bg-zinc-50/80 [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900/40">
-      <summary class="cursor-pointer select-none list-none flex items-center gap-2 px-3 py-2.5 text-xs font-medium text-zinc-600 [[data-theme=dark]_&]:text-zinc-400 [&::-webkit-details-marker]:hidden">
-        <.icon
-          name="hero-chevron-right"
-          class="size-4 shrink-0 transition-transform group-open:rotate-90"
-        /> 工具与流程（{@count} 条）· 点击展开
-      </summary>
-      <div class="space-y-2 border-t border-zinc-200/80 px-2 py-3 [[data-theme=dark]_&]:border-zinc-800">
-        <%= for i <- @items do %>
-          <.chat_bubble entry={i} />
+    <details class="wb-tool-flow">
+      <summary>
+        <.icon name="hero-chevron-right" class="size-3" /><.icon
+          name="hero-command-line"
+          class="size-3.5"
+        />
+        已执行 {@completed} 步<%= if @completed < length(@rows) do %>
+          · 正在运行
         <% end %>
+      </summary>
+      <div class="wb-tool-list">
+        <details :for={row <- @rows} class="wb-tool-row" data-call-id={row.id} data-state={row.state}>
+          <summary>
+            <.icon
+              name={if(row.state == :error, do: "hero-exclamation-circle", else: "hero-check-circle")}
+              class="size-4"
+            /><code>{row.name}</code><span class="truncate">{row.label}</span><span class="tool-state">{case row.state do :running -> "执行中"; :error -> "失败"; _ -> "已完成" end}</span>
+          </summary>
+          <p :if={row.output != nil} class="wb-tool-preview">{String.slice(row.output, 0, 240)}</p>
+          <details :if={row.args != nil} class="mt-2">
+            <summary>调用参数</summary>
+            <pre class="wb-tool-output">{Jason.encode!(row.args, pretty: true)}</pre>
+          </details>
+          <details :if={row.output != nil} class="mt-2">
+            <summary>完整输出</summary>
+            <pre class="wb-tool-output">{row.output}</pre>
+            <button
+              type="button"
+              phx-click={JS.dispatch("fluxclaw:copy", detail: %{text: row.output})}
+              class="wb-secondary mt-2"
+              aria-label="复制工具输出"
+            >
+              <.icon name="hero-document-duplicate" class="size-3.5" />复制输出
+            </button>
+          </details>
+        </details>
       </div>
     </details>
     """
@@ -3798,6 +4033,7 @@ defmodule FluxClawWeb.ChatLive do
       assigns
       |> assign(:editing?, editing?)
       |> assign(:draft, draft)
+      |> assign(:edit_form, to_form(%{"text" => draft, "user_message_id" => assigns.msg_id}))
       |> assign(:n_variants, n_variants)
       |> assign(:show_nav, show_nav)
       |> assign(:show_actions, show_actions)
@@ -3808,37 +4044,39 @@ defmodule FluxClawWeb.ChatLive do
       <div class="flex w-full justify-end gap-2.5 items-end">
         <div class="flex min-w-0 max-w-[min(40rem,calc(100%-2.5rem))] flex-1 flex-col items-end">
           <%= if @editing? do %>
-            <form
+            <.form
+              for={@edit_form}
               phx-submit="submit_user_edit"
               id={"user-edit-form-#{@msg_id}"}
-              class="w-full rounded-2xl rounded-br-md bg-emerald-700 p-3 text-white shadow-sm"
+              class="wb-action-card w-full"
             >
-              <input type="hidden" name="user_message_id" value={@msg_id} />
-              <textarea
-                name="text"
+              <.input type="hidden" field={@edit_form[:user_message_id]} />
+              <.input
+                type="textarea"
+                field={@edit_form[:text]}
                 id={"user-edit-ta-#{@msg_id}"}
                 rows="4"
-                class="w-full rounded-lg border border-emerald-500/40 bg-emerald-800/40 px-3 py-2 text-[15px] text-white placeholder:text-emerald-200/60"
-              ><%= @draft %></textarea>
+                class="wb-answer-input"
+              />
               <div class="mt-2 flex justify-end gap-2">
                 <button
                   type="button"
                   phx-click="cancel_edit_user"
-                  class="rounded-lg px-3 py-1.5 text-sm text-emerald-100 hover:bg-emerald-800/50"
+                  class="wb-secondary"
                 >
                   取消
                 </button>
                 <button
                   type="submit"
-                  class="rounded-lg bg-white px-3 py-1.5 text-sm font-medium text-emerald-700 hover:bg-emerald-50"
+                  class="wb-primary"
                 >
                   发送
                 </button>
               </div>
-            </form>
+            </.form>
           <% else %>
             <div class="flex w-full max-w-full flex-col items-end">
-              <div class="min-w-0 max-w-full rounded-2xl rounded-br-md bg-emerald-600 px-4 py-2.5 text-[15px] leading-relaxed text-white shadow-sm">
+              <div class="wb-user">
                 <div class="whitespace-pre-wrap">{@content}</div>
               </div>
               <%= if @show_actions do %>
@@ -3944,16 +4182,20 @@ defmodule FluxClawWeb.ChatLive do
         <.bubble_assistant content={message_content_string(content)} msg_id={to_string(id)} />
       <% {:assistant, content} -> %>
         <.bubble_assistant content={message_content_string(content)} />
+      <% {:stopped, id} -> %>
+        <p id={"stopped-#{id}"} class="wb-run-status" role="status">
+          <.icon name="hero-stop-circle" class="size-4" />已停止 · 已完成的操作和部分回答已保留
+        </p>
       <% {:reasoning, content} -> %>
-        <details class="group rounded-xl border border-violet-200/80 bg-violet-50/80 [[data-theme=dark]_&]:border-violet-900/40 [[data-theme=dark]_&]:bg-violet-950/25">
-          <summary class="cursor-pointer select-none list-none flex items-center gap-2 px-4 py-2.5 text-xs font-medium text-violet-700 [[data-theme=dark]_&]:text-violet-300 [&::-webkit-details-marker]:hidden">
+        <details class="wb-reasoning group">
+          <summary class="cursor-pointer select-none list-none flex items-center gap-2 text-xs">
             <.icon
               name="hero-chevron-right"
               class="size-4 shrink-0 transition-transform group-open:rotate-90"
             />
-            <.icon name="hero-sparkles" class="size-4" /> 思考过程 · 点击展开
+            <.icon name="hero-sparkles" class="size-4" /> 模型推理 · 点击展开
           </summary>
-          <div class="chat-md border-t border-violet-200/60 px-4 py-3 text-sm [[data-theme=dark]_&]:border-violet-900/40">
+          <div class="chat-md">
             {raw(md_html(message_content_string(content)))}
           </div>
         </details>
@@ -3993,7 +4235,7 @@ defmodule FluxClawWeb.ChatLive do
   def bubble_user(assigns) do
     ~H"""
     <div class="flex justify-end gap-2.5 items-end">
-      <div class="max-w-[min(40rem,85%)] rounded-2xl rounded-br-md bg-emerald-600 text-white px-4 py-2.5 text-[15px] leading-relaxed shadow-sm">
+      <div class="wb-user">
         <div class="whitespace-pre-wrap">{@content}</div>
       </div>
       <img
@@ -4017,15 +4259,8 @@ defmodule FluxClawWeb.ChatLive do
 
     ~H"""
     <div class="flex w-full min-w-0 justify-start gap-2.5 items-start">
-      <img
-        src={~p"/images/fluxclaw-assistant.png"}
-        alt=""
-        width="32"
-        height="32"
-        class="size-8 rounded-full shrink-0 object-cover ring-2 ring-emerald-100 shadow-sm mt-1 [[data-theme=dark]_&]:ring-emerald-900/50"
-      />
       <div class="flex min-w-0 flex-1 max-w-[min(48rem,100%)] flex-col items-stretch">
-        <div class="chat-md rounded-2xl rounded-bl-md border border-zinc-200 bg-zinc-50 px-4 py-3 text-[15px] leading-relaxed [[data-theme=dark]_&]:border-zinc-800 [[data-theme=dark]_&]:bg-zinc-900/60">
+        <div class="wb-assistant chat-md">
           {raw(@html)}
         </div>
         <%= if @show_action_bar do %>

@@ -1,39 +1,45 @@
 defmodule FluxClawWeb.ChatLiveTest do
-  use FluxClawWeb.ConnCase, async: true
-
+  use FluxClawWeb.ConnCase, async: false
   import Phoenix.LiveViewTest
 
-  @moduletag :live_view_smoke
-
-  test "renders the dsh-style three-pane frame", %{conn: conn} do
-    {:ok, view, _html} = live(conn, "/")
-
-    assert has_element?(view, "#sidebar-root")
-    assert has_element?(view, "#sidebar-right")
+  test "welcome has one composer and collapsed details", %{conn: conn} do
+    {:ok, view, _} = live(conn, "/")
+    assert has_element?(view, "#workbench-welcome")
+    assert has_element?(view, "#chat-send-form textarea[phx-hook=ChatComposer]")
+    assert has_element?(view, "#details-toggle[aria-expanded=false]")
+    assert has_element?(view, "#conversation-turns[phx-update=stream]")
+    assert has_element?(view, "#new-task")
   end
 
-  test "right sidebar defaults to the plugin manager tab", %{conn: conn} do
-    {:ok, view, _html} = live(conn, "/")
-
-    assert has_element?(view, "#plugin-panel")
-    assert has_element?(view, "button[phx-value-tab=timeline]")
-    assert has_element?(view, "button[phx-value-tab=memory]")
-    assert has_element?(view, "button[phx-value-tab=plugins]")
+  test "examples populate the draft without starting a task", %{conn: conn} do
+    {:ok, view, _} = live(conn, "/")
+    view |> element("#example-research") |> render_click()
+    assert_push_event(view, "composer-fill", %{text: text})
+    assert text =~ "搜索"
+    assert has_element?(view, "#workbench-welcome")
   end
 
-  test "switching right tabs shows memory and timeline panels", %{conn: conn} do
-    {:ok, view, _html} = live(conn, "/")
+  test "details exposes resources, actual integration settings and files", %{conn: conn} do
+    {:ok, view, _} = live(conn, "/")
+    view |> element("#details-toggle") |> render_click()
+    assert has_element?(view, "#details-toggle[aria-expanded=true]")
+    assert has_element?(view, "#memory-panel")
+    view |> element("#detail-tab-plugins") |> render_click()
+    assert has_element?(view, "#integration-settings")
+    assert has_element?(view, "#native-integrations")
+    view |> element("#detail-tab-files") |> render_click()
+    assert has_element?(view, "#artifact-panel")
+    view |> element("#refresh-artifacts") |> render_click()
+    assert has_element?(view, "#artifact-files")
+    render_click(view, "close_drawers")
+    assert has_element?(view, "#details-toggle[aria-expanded=false]")
+  end
 
-    assert view |> element("button[phx-value-tab=memory]") |> render_click() =~
-             "记忆与技能"
-
-    assert has_element?(view, "button[phx-value-tab=timeline]")
-
-    assert view |> element("button[phx-value-tab=timeline]") |> render_click() =~
-             "运行轨迹"
-
-    # Switching back to plugins keeps the panel available.
-    assert view |> element("button[phx-value-tab=plugins]") |> render_click() =~
-             "Cordis 运行时"
+  test "empty user answers keep the actionable question visible", %{conn: conn} do
+    {:ok, view, _} = live(conn, "/")
+    send(view.pid, {:ask_user, 123, "What should I do?"})
+    assert has_element?(view, "#ask-user-form")
+    view |> form("#ask-user-form", %{"text" => " ", "ref" => "123"}) |> render_submit()
+    assert has_element?(view, "#ask-user-form")
   end
 end

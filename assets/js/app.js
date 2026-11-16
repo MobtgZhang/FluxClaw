@@ -26,6 +26,13 @@ import {hooks as colocatedHooks} from "phoenix-colocated/flux_claw"
 import topbar from "../vendor/topbar"
 import EasyMDE from "easymde"
 
+const applyTheme = theme => {
+  const resolved = theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light"
+  document.documentElement.setAttribute("data-theme", resolved)
+}
+try { applyTheme(localStorage.getItem("phx:theme") || "system") } catch (_) {}
+window.addEventListener("storage", event => { if (event.key === "phx:theme") applyTheme(event.newValue || "system") })
+
 const Hooks = {
   SidebarContextMenu: {
     mounted() {
@@ -116,6 +123,17 @@ const Hooks = {
   },
   ChatScroll: {
     mounted() {
+      this.following = true
+      this.jump = document.getElementById("jump-to-latest")
+      this.onScroll = () => {
+        this.following = this.el.scrollHeight - this.el.clientHeight - this.el.scrollTop < 100
+        if (this.following) this.jump?.classList.add("hidden")
+      }
+      this.onJump = () => { this.following = true; this.scrollBottom(); this.jump?.classList.add("hidden") }
+      this.el.addEventListener("scroll", this.onScroll, {passive: true})
+      this.jump?.addEventListener("click", this.onJump)
+      this.observer = new ResizeObserver(() => this.onContentChange())
+      this.observer.observe(this.el.firstElementChild)
       this.scrollBottom()
       const evName = this.el.getAttribute("data-external-link-event") || "external_link_click"
       this._externalLinkHandler = e => {
@@ -158,12 +176,20 @@ const Hooks = {
       })
     },
     destroyed() {
+      this.el.removeEventListener("scroll", this.onScroll)
+      this.jump?.removeEventListener("click", this.onJump)
+      this.observer?.disconnect()
       if (this._externalLinkHandler) {
         this.el.removeEventListener("click", this._externalLinkHandler)
       }
     },
-    updated() {
-      this.scrollBottom()
+    updated() { this.onContentChange() },
+    onContentChange() {
+      if (this.following) {
+        requestAnimationFrame(() => this.scrollBottom())
+      } else {
+        this.jump?.classList.remove("hidden")
+      }
     },
     scrollBottom() {
       this.el.scrollTop = this.el.scrollHeight
@@ -171,23 +197,34 @@ const Hooks = {
   },
   ChatComposer: {
     mounted() {
+      this.key = "fluxclaw:draft:" + this.el.dataset.draftKey
+      try { this.el.value = sessionStorage.getItem(this.key) || "" } catch (_) {}
       this.resize()
-      this.el.addEventListener("input", () => this.resize())
-      this.el.addEventListener("keydown", (e) => this.onKeydown(e))
+      this.onInput = () => { this.resize(); try { sessionStorage.setItem(this.key, this.el.value) } catch (_) {} }
+      this.onKey = event => this.onKeydown(event)
+      this.handleEvent("composer-clear", () => { this.el.value = ""; this.onInput() })
+      this.handleEvent("composer-attach", ({paths}) => { this.el.value += "\n\n附件路径：\n" + paths.join("\n"); this.onInput(); this.el.focus() })
+      this.handleEvent("composer-fill", ({text}) => { this.el.value = text || ""; this.onInput(); this.el.focus() })
+      this.el.addEventListener("input", this.onInput)
+      this.el.addEventListener("keydown", this.onKey)
     },
-    updated() {
-      this.resize()
+    updated() { this.resize() },
+    destroyed() {
+      this.el.removeEventListener("input", this.onInput)
+      this.el.removeEventListener("keydown", this.onKey)
     },
     resize() {
       this.el.style.height = "auto"
       this.el.style.height = Math.min(this.el.scrollHeight, 220) + "px"
     },
     onKeydown(e) {
-      if (e.key !== "Enter" || e.shiftKey || e.isComposing) return
+      if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return
       e.preventDefault()
-      this.el.closest("form")?.requestSubmit()
+      if (this.el.closest("form")?.querySelector("#chat-stop-btn, button[type=submit]:disabled")) return
+      if (this.el.value.trim()) this.el.closest("form")?.requestSubmit()
     }
   }
+
 }
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
@@ -210,6 +247,9 @@ liveSocket.connect()
 // >> liveSocket.enableLatencySim(1000)  // enabled for duration of browser session
 // >> liveSocket.disableLatencySim()
 window.liveSocket = liveSocket
+window.addEventListener("fluxclaw:copy", event => {
+  navigator.clipboard.writeText(event.detail.text || "").catch(() => {})
+})
 
 // The lines below enable quality of life phoenix_live_reload
 // development features:
@@ -246,3 +286,21 @@ if (process.env.NODE_ENV === "development") {
   })
 }
 
+
+// Preserve focus when a drawer closes; keep keyboard navigation inside mobile drawers.
+let drawerTrigger = null
+const drawerVisible = element => element && getComputedStyle(element).display !== "none" && element.getBoundingClientRect().right > 0 && element.getBoundingClientRect().left < innerWidth
+window.addEventListener("click", event => {
+  if (event.target.closest("[phx-click=toggle_sidebar], [phx-click=toggle_right], [phx-click=set_right_tab]")) drawerTrigger = event.target.closest("button")
+})
+window.addEventListener("keydown", event => {
+  if (event.key === "Escape" && drawerTrigger) { requestAnimationFrame(() => drawerTrigger?.focus()); return }
+  if (event.key !== "Tab") return
+  const drawer = [document.getElementById("sidebar-right"), document.getElementById("sidebar-root")].find(element => drawerVisible(element) && getComputedStyle(element).position === "fixed")
+  if (!drawer) return
+  const focusable = [...drawer.querySelectorAll("button, a, input, textarea, select, summary")].filter(element => !element.disabled && element.getClientRects().length)
+  const first = focusable[0], last = focusable[focusable.length - 1]
+  if (!first) return
+  if (event.shiftKey && (document.activeElement === first || !drawer.contains(document.activeElement))) { event.preventDefault(); last.focus() }
+  if (!event.shiftKey && (document.activeElement === last || !drawer.contains(document.activeElement))) { event.preventDefault(); first.focus() }
+})
