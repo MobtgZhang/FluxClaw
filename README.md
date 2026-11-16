@@ -1,96 +1,211 @@
 # FluxClaw
 
-基于 **BEAM（Erlang/OTP）**、**Phoenix LiveView** 和 **Electron** 的通用 LLM Agent 工作台。在项目中开展研究、编写代码和生成文档；通过流式对话、工具活动、人工问答和文件交付追踪任务。支持暖白 / 深色主题、移动端布局与独立桌面运行。
+**A general-purpose LLM Agent Workbench for research, coding, and document creation.**
 
-新版操作说明见 **[工作台与原生集成](docs/workbench.md)**；桌面安装、构建和验证见 **[Electron 桌面版](docs/desktop.md)**。
+FluxClaw combines **Phoenix LiveView**, **BEAM / Erlang OTP**, and **Electron** to bring projects, conversations, tools, memory, and deliverables into one workspace. Use it in a browser or as a desktop application with its own local backend.
 
-本轮测试结果、安装包与验证范围见 **[交付验收](reports/validation.md)**。
+![FluxClaw desktop workbench](reports/images/workbench-desktop.png)
 
-架构与记忆分层说明见 **[docs/architecture.md](docs/architecture.md)**、**[docs/agent-and-memory.md](docs/agent-and-memory.md)**、**[docs/tools-and-safety.md](docs/tools-and-safety.md)**。
+## Features
 
-## 功能概要
+- **Project workspaces** — Organize conversations, reusable skills, memory documents, and working checkpoints by project.
+- **Streaming conversations** — Connect to an OpenAI-compatible Chat Completions endpoint with SSE streaming. Read earlier content without being pulled to the bottom, and jump back to the latest response when ready.
+- **Visible tool execution** — Inspect grouped activity, parameters, results, and failures. Persistent call IDs distinguish repeated calls to the same tool, including after a refresh.
+- **Human interaction** — Answer agent questions in dedicated cards, review proposed file changes, and preview skill suggestions before saving them.
+- **Files and deliverables** — Upload attachments and browse, preview, or download real files from the current session workspace.
+- **Native integrations** — Call SciPhi AgentSearch and the bundled Google Harness² implementation directly through the existing LLM tool interface.
+- **Reliable task controls** — Restore conversation drafts within the same window, use IME-safe keyboard input, and stop execution while retaining partial answers and completed tool results.
+- **Responsive interface** — Warm light and charcoal dark themes, collapsible navigation, optional details, and mobile drawers.
+- **Desktop runtime** — Electron bundles a Phoenix release, ERTS, and Python, with local data storage and an authenticated loopback backend.
+- **Plugin support** — Extend tools through the DeepSeek Harness / Cordis bridge, including npm plugins and local `.mjs` plugins.
 
-- **路由**：`/`、`/chat`、`/chat/:session_id`、`/p/:project_id`；旧 `/agents` 重定向到 `/`。
-- **OTP**：Registry + DynamicSupervisor 按会话拉起 Agent；工具沙箱按会话目录隔离。
-- **LLM**：OpenAI 兼容 Chat Completions，**真实 SSE**（`stream: true`）；测试使用 Mock。
-- **工具**：`file_read` / `file_write` / `file_patch` / `shell_execute` / `web_fetch` / `task_plan` / `ask_user` / `update_working_checkpoint` / `start_long_term_update`（见 `lib/flux_claw/tool.ex`）。
-- **原生集成**：`agent_search` 对接 SciPhi AgentSearch 自托管或托管契约，返回可引用来源；`harness2_optimize` 调用内置的 Google Harness² 固定版本，通过当前模型递归改进文本成果，保存答案、评估轨迹和经验。两者直接进入现有 LLM function calling。
-- **交付**：会话附件上传、沙箱文件预览 / 下载；停止保留部分正文和已完成工具结果；会话草稿在当前窗口恢复。
-- **桌面**：Electron 随包携带 Phoenix release、ERTS 和 Python，独立管理本机数据库、配置与工作目录。Linux 安装包可在本机构建；macOS / Windows 通过原生构建工作流提供构建入口。
-- **插件**：兼容 DeepSeek Harness（Cordis）工具插件，支持官方 npm 插件与本地 `.mjs` 插件（见 [docs/plugins.md](docs/plugins.md)）。
-- **数据**：SQLite + Ecto — `projects`、`agent_sessions`（含 `project_id`）、`skills`（含 `project_id`、`source`）等。
-- **CI**：`.github/workflows/ci.yml`（参考 `idea/` 中「会话 + 流式」产品方向，落地为 compile / format / test）。
+## Quick Start
 
-## 依赖环境
+### Prerequisites
 
-- **Elixir** 1.15+、**Erlang/OTP**（与发行版匹配）。
-- **SQLite**（开发库见 `config/dev.exs`）。
+- Elixir and Erlang/OTP compatible with the project dependencies. The desktop build workflow uses **Elixir 1.18 / OTP 27**.
+- **Node.js 22+** and npm for asset setup, the plugin bridge, and Electron development.
+- Native build tools required by dependencies such as the SQLite adapter. No separate database server is required.
+- An OpenAI-compatible model endpoint and credentials for live agent tasks.
+- **Python 3.12 or 3.13** if you want to use Harness² from the web application. Desktop packages include Python.
 
-## 快速开始
+### Run the Web Application
 
 ```bash
-cd /path/to/FluxClaw
-make setup
-# 或: mix deps.get && mix setup
+git clone https://github.com/MobtgZhang/FluxClaw.git
+cd FluxClaw
+mix setup
 ```
 
-创建 **`.fluxclaw/config.json`**（可从 **[.fluxclaw/config.example.json](.fluxclaw/config.example.json)** 复制）：
+Copy the example configuration:
+
+```bash
+cp .fluxclaw/config.example.json .fluxclaw/config.json
+```
+
+Set your model credentials in `.fluxclaw/config.json`, or use environment variables:
+
+```bash
+export OPENAI_API_KEY="your-api-key"
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+export OPENAI_MODEL="your-model-name"
+mix phx.server
+```
+
+Open [http://localhost:4000](http://localhost:4000), choose a project, and start a conversation. Model settings can also be edited in the application.
+
+## Configuration
+
+A minimal configuration looks like this:
 
 ```json
 {
   "openai": {
-    "api_key": "sk-你的密钥",
+    "api_key": "your-api-key",
     "base_url": "https://api.openai.com/v1",
-    "model": "gpt-4o-mini"
+    "model": "your-model-name"
   },
   "sandbox_root": "./flux_claw_sandbox",
-  "cache_paths": {
-    "external_skills": "",
-    "internal_skills": "",
-    "history_root": ""
+  "agents": {
+    "max_steps": 32
+  },
+  "integrations": {
+    "search_url": "",
+    "search_mode": "local",
+    "search_key": "",
+    "python": ""
   }
 }
 ```
 
-环境变量可覆盖文件配置：`OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`、`FLUX_CLAW_SANDBOX`、`FLUXCLAW_MAX_STEPS`（或 JSON 中 `agents.max_steps`，**`-1` 表示不限制轮次**）、`FLUXCLAW_CACHE_EXTERNAL_SKILLS`、`FLUXCLAW_CACHE_INTERNAL_SKILLS`、`FLUXCLAW_CACHE_HISTORY`、`FLUX_CLAW_CONFIG_PATH`。
+By default, FluxClaw reads `.fluxclaw/config.json` and merges overrides from `fluxclaw/cache/config.json`. Settings saved in the application go to the latter file. Set `FLUXCLAW_CONFIG_PATH` to use one explicit file for both reading and writing; `FLUX_CLAW_CONFIG_PATH` is also supported.
 
-启用 **DeepSeek Harness 插件** 时，把 **[.fluxclaw/cordis.example.yml](.fluxclaw/cordis.example.yml)** 复制为 **`.fluxclaw/cordis.yml`**，或在 `FLUXCLAW_CORDIS_CONFIG` 中指定配置路径。
+Environment variables take precedence over the corresponding file settings:
 
-```bash
-make serve
-# 或: mix phx.server
-```
+- **Model:** `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`.
+- **Execution:** `FLUX_CLAW_SANDBOX`, `FLUXCLAW_MAX_STEPS`. A step limit of `-1` allows unlimited agent rounds.
+- **Storage:** `FLUXCLAW_CACHE_ROOT`, `FLUXCLAW_CACHE_EXTERNAL_SKILLS`, `FLUXCLAW_CACHE_INTERNAL_SKILLS`, `FLUXCLAW_CACHE_HISTORY`, `FLUXCLAW_CACHE_MEMORY`.
+- **Integrations:** `AGENT_SEARCH_URL`, `AGENT_SEARCH_MODE`, `AGENT_SEARCH_API_KEY`, `FLUXCLAW_PYTHON`.
 
-浏览器打开：**http://localhost:4000/**
+The [example configuration](.fluxclaw/config.example.json) includes additional sampling and storage options. Set environment variables before starting the application.
 
-## Makefile 常用命令
+## Native LLM Tools
 
-| 目标 | 说明 |
-|------|------|
-| `make setup` | `mix setup`（依赖、数据库、前端资源） |
-| `make test` | `mix test` |
-| `make serve` | `mix phx.server` |
-| `make precommit` | `mix precommit`（与 AGENTS.md 一致） |
-| `make clean-sandbox` | 删除本地沙箱目录（`flux_claw_sandbox`、`tmp/...`） |
-| `make clean-assets` | 删除 `priv/static/assets` 构建产物 |
-| `make clean-artifacts` | 删除 `_build`、`deps`、沙箱与 assets（**慎用**） |
+Built-in tools cover file reading and editing, patch application, shell commands, web fetching, task planning, user questions, working checkpoints, and durable memory. Their schemas and dispatch are defined in [the tool registry](lib/flux_claw/tool.ex).
 
-数据库重置（会清空数据）：
+### AgentSearch
+
+The native `agent_search` tool connects to [SciPhi-AI/agent-search](https://github.com/SciPhi-AI/agent-search) and returns numbered citations, source URLs, titles, and bounded excerpts.
+
+Configure it in the details panel or before starting FluxClaw:
 
 ```bash
-mix ecto.reset
+export AGENT_SEARCH_URL="http://127.0.0.1:8000"
+export AGENT_SEARCH_MODE="local"
+# Optional, when required by your service:
+export AGENT_SEARCH_API_KEY="your-search-key"
 ```
 
-## 测试
+`local` uses the upstream hierarchical `/search` contract. `sciphi` supports the historical hosted API contract. The model supplies the query and result limit; the server owns the endpoint and credentials.
+
+**A deployed AgentSearch service with a populated index is required.** FluxClaw does not bundle the search databases, embedding models, or datasets. Availability of the historical hosted API has not been verified. The upstream self-hosted stack requires Python below 3.12 and should run separately from Harness².
+
+### Harness²
+
+The native `harness2_optimize` tool uses a pinned copy of [google-research/harness2](https://github.com/google-research/harness2) with a FluxClaw text-task adapter. It generates candidates, refines Markdown prompt components, selects a deliverable, and saves reusable experience through the currently configured model.
+
+- `operation: "optimize"` accepts a text task and produces an answer, report, and execution evidence.
+- `operation: "demo"` runs the upstream deterministic ledger tasks without model credentials.
+- `mode` supports `parallel` or `sequential`; `k` supports `1` or `2`.
+- Each run is limited to 30 model calls and 300 seconds. Optimization can incur multiple model requests and associated costs.
+
+For web development, select a compatible interpreter:
 
 ```bash
-make test
+export FLUXCLAW_PYTHON="/absolute/path/to/python3.12"
 ```
 
-## 设计备忘
+The bundled core requires no third-party Python packages. Outputs live under the session workspace in `harness2/<run-id>/`, with reusable experience under `harness2/library/`.
 
-`idea/idea1.md`、`idea/idea2.md` 记录 Erlang 会话与 LiveView 流式相关思路；实现细节以 `docs/` 与代码为准。
+This integration optimizes text deliverables and prompt components. It does not execute model-generated code or provision the upstream benchmark environments. See the [upstream integration notes](docs/upstream-integrations.md) for the pinned revision, API contracts, and implementation scope.
 
-## 许可
+## Electron Desktop
 
-见仓库根目录 `LICENSE`。
+Linux builds produce an **AppImage** and a **deb** package under `desktop/dist/`. The packaged application includes Phoenix, ERTS, and Python, so end users do not need to install Elixir or Python separately. The first launch migrates the local database.
+
+To open a development window, first run `mix phx.server`, then use another terminal:
+
+```bash
+npm ci --prefix desktop
+npm run dev --prefix desktop
+```
+
+To build a distributable on the target operating system, complete `mix setup` and provide a standalone Python distribution matching that OS and architecture:
+
+```bash
+npm ci --prefix desktop
+export FLUXCLAW_PYTHON_BUNDLE="/absolute/path/to/standalone-python-root"
+npm run dist --prefix desktop
+```
+
+On Unix, the Python root must contain `bin/python3`; on Windows, it must contain `python.exe`. A virtual environment containing links to an external interpreter is insufficient.
+
+The [desktop workflow](.github/workflows/desktop.yml) provides native Linux, macOS, and Windows build jobs. **Linux x64 packaging and launch have been verified.** macOS and Windows configurations have not been tested on their target hosts. Code signing, macOS notarization, and automatic updates are not configured.
+
+Desktop data is stored in Electron's `userData` directory. Use the application's File menu to open that directory, or set `FLUXCLAW_DESKTOP_DATA` to an explicit location. See the [desktop guide](docs/desktop.md) for installation, logs, storage, and release details.
+
+## Plugins
+
+To enable the DeepSeek Harness / Cordis integration, copy `.fluxclaw/cordis.example.yml` to `.fluxclaw/cordis.yml`, or point `FLUXCLAW_CORDIS_CONFIG` to your configuration file. See the [plugin guide](docs/plugins.md) for supported packages and local plugins.
+
+## Execution and Data Boundaries
+
+Session file tools reject path traversal and symbolic links, and artifact delivery applies file-count, depth, preview, and download limits. Uploads accept up to five files per batch, each up to 8 MB.
+
+**Session directories provide path isolation, not an operating-system sandbox.** Shell commands run with the backend user's permissions. Use a separate isolated environment for untrusted tasks. Stopping a task does not undo file writes or external actions that have already completed.
+
+The desktop backend binds to a random loopback port and requires a per-launch credential. Electron enables renderer sandboxing and context isolation, with Node integration disabled. These renderer controls do not isolate backend shell commands. Model credentials are stored in local configuration files rather than an operating-system keychain.
+
+## Development and Validation
+
+```bash
+# Compile with warnings as errors, format, and run tests
+mix precommit
+
+# Include the actual Harness² runtime tests
+FLUXCLAW_PYTHON=/absolute/path/to/python3.12 mix precommit
+
+# Exercise the text adapter with deterministic model responses
+FLUXCLAW_PYTHON=/absolute/path/to/python3.12 python3 test/integrations/harness2_bridge_smoke.py
+
+# Desktop unit tests
+npm ci --prefix desktop
+npm test --prefix desktop
+
+# Prepare the bundled backend and Python before desktop smoke testing
+FLUXCLAW_PYTHON_BUNDLE=/absolute/path/to/standalone-python-root npm run prepare:backend --prefix desktop
+npm run test:smoke --prefix desktop
+```
+
+The desktop smoke test uses temporary data and a local model fixture to exercise streaming, drafts, IME input, tool execution, clipboard access, attachments, user questions, cancellation, and responsive navigation. These tests do not establish paid-model quality or external search-service availability.
+
+The [acceptance report](reports/validation.md) records the verified commands and limits: 55 backend tests with Harness² enabled, four desktop unit tests, and full workflow checks against the Linux unpacked application and AppImage.
+
+Makefile shortcuts are also available: `make setup`, `make serve`, `make test`, and `make precommit`.
+
+## Documentation
+
+- [Workbench workflows and native integrations](docs/workbench.md)
+- [Electron installation and packaging](docs/desktop.md)
+- [Upstream integration research](docs/upstream-integrations.md)
+- [Architecture](docs/architecture.md)
+- [Agents and memory](docs/agent-and-memory.md)
+- [Tools and execution boundaries](docs/tools-and-safety.md)
+- [Plugins](docs/plugins.md)
+- [Acceptance results and interface captures](reports/validation.md)
+
+The detailed guides currently contain Chinese-language documentation. This README provides the English entry point.
+
+## License
+
+FluxClaw is licensed under [Apache-2.0](LICENSE). The vendored Harness² source retains its [upstream license](priv/integrations/harness2_vendor/LICENSE) and [revision notice](priv/integrations/harness2_vendor/UPSTREAM.md). Third-party dependencies, models, datasets, and services remain subject to their own licenses and terms.
