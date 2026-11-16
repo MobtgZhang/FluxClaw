@@ -63,7 +63,8 @@ defmodule FluxClaw.Agents.AgentWorker do
       step: 0,
       pending: nil,
       last_user_text: nil,
-      trace: []
+      trace: [],
+      running_task: nil
     }
 
     if should_auto_resume?(conversation) do
@@ -91,6 +92,9 @@ defmodule FluxClaw.Agents.AgentWorker do
 
   defp db_row_to_llm(%{role: "user", content: c}) when is_binary(c),
     do: [%{"role" => "user", "content" => c}]
+
+  defp db_row_to_llm(%{role: "assistant", content: c, metadata: %{"stopped" => true}}),
+    do: [%{"role" => "assistant", "content" => c || ""}]
 
   defp db_row_to_llm(%{role: "assistant", content: c, metadata: meta})
        when is_map(meta) do
@@ -201,8 +205,8 @@ defmodule FluxClaw.Agents.AgentWorker do
       sid = state.session_id
       parent = self()
 
-      _ =
-        Task.start(fn ->
+      {:ok, task} =
+        Task.start_link(fn ->
           try do
             stream_llm(parent, sid, state)
           rescue
@@ -211,8 +215,14 @@ defmodule FluxClaw.Agents.AgentWorker do
           end
         end)
 
-      {:noreply, state}
+      {:noreply, %{state | running_task: task}}
     end
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    if state.running_task, do: Process.exit(state.running_task, :kill)
+    :ok
   end
 
   defp stream_llm(parent, sid, state) do
@@ -281,6 +291,10 @@ defmodule FluxClaw.Agents.AgentWorker do
   end
 
   def handle_info({:diff_review_reply, _ref, _decision}, state), do: {:noreply, state}
+
+  def handle_info({:tool_result, call, rest, prefix, acc, result}, state) do
+    consume_tool_result(call, rest, state, prefix, acc, result)
+  end
 
   def handle_info(_other, state), do: {:noreply, state}
 
@@ -421,50 +435,26 @@ defmodule FluxClaw.Agents.AgentWorker do
     name = f["name"]
     args_json = f["arguments"] || "{}"
 
-    with {:ok, args} <- Jason.decode(args_json) do
+    with {:ok, args} when is_map(args) <- Jason.decode(args_json) do
       ctx = %{session_id: state.session_id, sandbox_root: state.sandbox_root}
-      _ = persist_tool_start(state.session_id, name, args)
-      broadcast(state.session_id, {:tool_start, name, args})
+      id = call["id"] || "call"
+      _ = persist_tool_start(state.session_id, id, name, args)
+      broadcast(state.session_id, {:tool_start, id, name, args})
+      parent = self()
 
-      case FluxClaw.Tool.run(name, args, ctx) do
-        {:suspend_ask, ref, question} ->
-          broadcast(state.session_id, {:ask_user, ref, question})
+      {:ok, task} =
+        Task.start_link(fn ->
+          result =
+            try do
+              FluxClaw.Tool.run(name, args, ctx)
+            rescue
+              error -> {:error, Exception.message(error)}
+            end
 
-          pending = %{
-            ref: ref,
-            call: call,
-            rest: rest,
-            prefix: prefix,
-            tool_acc: tool_acc
-          }
+          send(parent, {:tool_result, call, rest, prefix, tool_acc, result})
+        end)
 
-          {:noreply, %{state | pending: pending}}
-
-        {:suspend_review, ref, payload} ->
-          # Diff-review flow: propose the change and wait for keep/reject.
-          broadcast(state.session_id, {:diff_proposed, ref, payload})
-
-          pending = %{
-            ref: ref,
-            call: call,
-            rest: rest,
-            prefix: prefix,
-            tool_acc: tool_acc,
-            review: payload
-          }
-
-          {:noreply, %{state | pending: pending}}
-
-        {:ok, text} ->
-          append_tool_result(call, rest, state, prefix, tool_acc, text, [])
-
-        {:ok, text, opts} when is_list(opts) ->
-          state = apply_tool_opts(state, opts)
-          append_tool_result(call, rest, state, prefix, tool_acc, text, opts)
-
-        {:error, e} ->
-          append_tool_result(call, rest, state, prefix, tool_acc, "error: #{e}", [])
-      end
+      {:noreply, %{state | running_task: task}}
     else
       _ ->
         append_tool_result(
@@ -476,6 +466,50 @@ defmodule FluxClaw.Agents.AgentWorker do
           "error: invalid tool arguments JSON",
           []
         )
+    end
+  end
+
+  defp consume_tool_result(call, rest, state, prefix, tool_acc, result) do
+    state = %{state | running_task: nil}
+
+    case result do
+      {:suspend_ask, ref, question} ->
+        broadcast(state.session_id, {:ask_user, ref, question})
+
+        pending = %{
+          ref: ref,
+          call: call,
+          rest: rest,
+          prefix: prefix,
+          tool_acc: tool_acc
+        }
+
+        {:noreply, %{state | pending: pending}}
+
+      {:suspend_review, ref, payload} ->
+        # Diff-review flow: propose the change and wait for keep/reject.
+        broadcast(state.session_id, {:diff_proposed, ref, payload})
+
+        pending = %{
+          ref: ref,
+          call: call,
+          rest: rest,
+          prefix: prefix,
+          tool_acc: tool_acc,
+          review: payload
+        }
+
+        {:noreply, %{state | pending: pending}}
+
+      {:ok, text} ->
+        append_tool_result(call, rest, state, prefix, tool_acc, text, [])
+
+      {:ok, text, opts} when is_list(opts) ->
+        state = apply_tool_opts(state, opts)
+        append_tool_result(call, rest, state, prefix, tool_acc, text, opts)
+
+      {:error, e} ->
+        append_tool_result(call, rest, state, prefix, tool_acc, "error: #{e}", [])
     end
   end
 
@@ -672,12 +706,12 @@ defmodule FluxClaw.Agents.AgentWorker do
     })
   end
 
-  defp persist_tool_start(sid, name, args) do
+  defp persist_tool_start(sid, id, name, args) do
     Agents.append_message(sid, %{
       role: "tool",
       tool_name: name,
       content: Jason.encode!(args),
-      metadata: %{"phase" => "start"}
+      metadata: %{"phase" => "start", "call_id" => id}
     })
   end
 

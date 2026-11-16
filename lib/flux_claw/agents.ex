@@ -44,6 +44,50 @@ defmodule FluxClaw.Agents do
     |> Repo.update()
   end
 
+  @doc "Closes any interrupted tool calls before recording a durable stopped answer."
+  def record_stop(session_id, partial) do
+    FluxClaw.Repo.transaction(fn ->
+      messages = list_messages(session_id)
+
+      completed =
+        for m <- messages,
+            m.role == "tool",
+            m.metadata["phase"] == "done",
+            into: MapSet.new(),
+            do: m.metadata["call_id"]
+
+      calls =
+        for m <- messages,
+            m.role == "assistant",
+            call <- List.wrap(m.metadata["tool_calls"]),
+            not MapSet.member?(completed, call["id"]),
+            do: call
+
+      Enum.each(calls, fn call ->
+        {:ok, _} =
+          append_message(session_id, %{
+            role: "tool",
+            tool_name: get_in(call, ["function", "name"]),
+            content: "error: stopped by user; this call did not complete",
+            metadata: %{
+              "phase" => "done",
+              "call_id" => call["id"],
+              "name" => get_in(call, ["function", "name"])
+            }
+          })
+      end)
+
+      {:ok, message} =
+        append_message(session_id, %{
+          role: "assistant",
+          content: partial,
+          metadata: %{"stopped" => true}
+        })
+
+      message
+    end)
+  end
+
   def delete_session(%AgentSession{} = session) do
     Repo.delete(session)
   end
