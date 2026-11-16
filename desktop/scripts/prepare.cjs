@@ -1,0 +1,20 @@
+const {spawnSync} = require('node:child_process')
+const fs = require('node:fs')
+const path = require('node:path')
+const root = path.resolve(__dirname,'../..')
+function run(command,args,env={}) {
+  const result=spawnSync(command,args,{cwd:root,env:{...process.env,...env},stdio:'inherit',shell:process.platform==='win32'})
+  if (result.status!==0) throw new Error(command+' failed')
+}
+run(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['ci','--prefix','priv/plugins/bridge','--omit=dev'])
+run('mix',['assets.deploy'],{MIX_ENV:'prod'})
+run('mix',['release','--overwrite'],{MIX_ENV:'prod'})
+const resources=path.join(root,'desktop/resources')
+fs.mkdirSync(resources,{recursive:true})
+fs.rmSync(path.join(resources,'backend'),{recursive:true,force:true})
+fs.cpSync(path.join(root,'_build/prod/rel/flux_claw'),path.join(resources,'backend'),{recursive:true,dereference:true})
+const pythonRoot=process.env.FLUXCLAW_PYTHON_BUNDLE
+if (!pythonRoot || !fs.existsSync(pythonRoot)) throw new Error('Set FLUXCLAW_PYTHON_BUNDLE to a standalone Python 3.12/3.13 distribution root (bin/python3 on Unix, python.exe on Windows). The desktop bundle includes it for Harness².')
+fs.rmSync(path.join(resources,'python'),{recursive:true,force:true})
+fs.cpSync(pythonRoot,path.join(resources,'python'),{recursive:true,dereference:true})
+console.log('Bundled ERTS/Phoenix release and Python runtime.')

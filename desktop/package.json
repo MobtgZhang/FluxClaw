@@ -1,0 +1,75 @@
+{
+  "name": "fluxclaw-desktop",
+  "version": "0.1.0",
+  "description": "FluxClaw Agent Workbench",
+  "homepage": "https://github.com/MobtgZhang/FluxClaw",
+  "desktopName": "fluxclaw.desktop",
+  "author": "FluxClaw contributors",
+  "license": "Apache-2.0",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "prepare:backend": "node scripts/prepare.cjs",
+    "pack": "npm run prepare:backend && electron-builder --dir",
+    "dist": "npm run prepare:backend && electron-builder",
+    "test": "node --test test/*.test.cjs",
+    "test:smoke": "node test/smoke.cjs"
+  },
+  "devDependencies": {
+    "electron": "45.3.2",
+    "electron-builder": "26.18.0",
+    "playwright-core": "1.65.1"
+  },
+  "build": {
+    "appId": "io.fluxclaw.workbench",
+    "productName": "FluxClaw",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.cjs",
+      "backend.cjs",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/backend",
+        "to": "backend"
+      },
+      {
+        "from": "resources/python",
+        "to": "python"
+      }
+    ],
+    "asar": true,
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Development",
+      "icon": "build/icon.png",
+      "syncDesktopName": true,
+      "maintainer": "FluxClaw contributors"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.developer-tools"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "overrides": {
+    "minimatch@>=7.0.0 <11.0.1": "^11.0.1"
+  }
+}

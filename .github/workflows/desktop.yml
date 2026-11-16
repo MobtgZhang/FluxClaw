@@ -1,0 +1,55 @@
+name: Desktop packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.18"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install managed Python
+        run: uv python install 3.12
+      - name: Set standalone Python root
+        shell: bash
+        run: |
+          python_path="$(uv python find --managed-python 3.12)"
+          node -e 'const p=require("node:path");const root=process.platform==="win32"?p.dirname(process.argv[1]):p.dirname(p.dirname(process.argv[1]));require("node:fs").appendFileSync(process.env.GITHUB_ENV,"FLUXCLAW_PYTHON_BUNDLE="+root+"\nFLUXCLAW_PYTHON="+process.argv[1]+"\n")' "$python_path"
+      - run: mix deps.get
+      - run: mix setup
+      - run: mix precommit
+      - run: npm ci --prefix desktop
+      - run: npm test --prefix desktop
+      - run: npm run dist --prefix desktop
+      - name: Smoke the Linux release
+        if: runner.os == 'Linux'
+        env:
+          SMOKE_NO_SANDBOX: "1"
+          SMOKE_EXECUTABLE: ${{ github.workspace }}/desktop/dist/linux-unpacked/fluxclaw-desktop
+        run: xvfb-run -a npm run test:smoke --prefix desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FluxClaw-${{ runner.os }}
+          if-no-files-found: error
+          path: |
+            desktop/dist/*.AppImage
+            desktop/dist/*.deb
+            desktop/dist/*.dmg
+            desktop/dist/*.exe

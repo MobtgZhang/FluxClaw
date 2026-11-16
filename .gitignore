@@ -22,3 +22,9 @@ erl_crash.dump
 /tmp/
 /.fluxclaw/config.json
 /.fluxclaw/cordis.yml
+/desktop/node_modules/
+/desktop/resources/
+/desktop/dist/
+__pycache__/
+*.pyc
+/push.sh
