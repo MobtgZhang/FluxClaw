@@ -79,7 +79,8 @@ defmodule FluxClaw.Plugins.CordisRuntime do
     script_path = Keyword.get(opts, :script_path) || script_path()
 
     configured_node =
-      Keyword.get(opts, :node) || Application.get_env(:flux_claw, :plugins, [])[:node] || "node"
+      Keyword.get(opts, :node) || System.get_env("FLUXCLAW_NODE") ||
+        Application.get_env(:flux_claw, :plugins, [])[:node] || "node"
 
     node = System.find_executable(configured_node) || configured_node
 
