@@ -19,6 +19,12 @@ defmodule FluxClaw.Tools.SandboxTest do
     assert {:error, _} = Sandbox.resolve!(root, "../etc/passwd")
   end
 
+  test "rejects a symlink pointing outside the workspace", %{root: root} do
+    File.ln_s!(System.tmp_dir!(), Path.join(root, "escape"))
+    assert {:error, _} = Sandbox.resolve!(root, "escape/secret.txt")
+    assert {:error, _} = Sandbox.resolve!(root, "escape/new/draft.md")
+  end
+
   defp random_hex do
     :crypto.strong_rand_bytes(6) |> Base.encode16(case: :lower)
   end

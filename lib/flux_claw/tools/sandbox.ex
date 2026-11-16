@@ -1,21 +1,35 @@
 defmodule FluxClaw.Tools.Sandbox do
   @moduledoc false
-
   def resolve!(sandbox_root, relative) when is_binary(sandbox_root) and is_binary(relative) do
     base = Path.expand(sandbox_root)
-    File.mkdir_p!(base)
     joined = Path.expand(relative, base)
 
-    if safe_path?(base, joined) do
-      {:ok, joined}
-    else
-      {:error, "path escapes sandbox"}
+    cond do
+      String.contains?(relative, <<0>>) ->
+        {:error, "invalid path"}
+
+      joined != base and not String.starts_with?(joined, String.trim_trailing(base, "/") <> "/") ->
+        {:error, "path escapes sandbox"}
+
+      symlink_component?(joined) ->
+        {:error, "symbolic links are not allowed in sandbox paths"}
+
+      true ->
+        File.mkdir_p!(base)
+        {:ok, joined}
     end
   end
 
-  defp safe_path?(base, path) do
-    base = String.trim_trailing(base, "/")
-    path = Path.expand(path)
-    path == base or String.starts_with?(path, base <> "/")
+  defp symlink_component?(path) do
+    Path.split(path)
+    |> tl()
+    |> Enum.reduce_while(path |> Path.split() |> hd(), fn part, acc ->
+      next = Path.join(acc, part)
+
+      case File.lstat(next) do
+        {:ok, %{type: :symlink}} -> {:halt, true}
+        _ -> {:cont, next}
+      end
+    end) == true
   end
 end

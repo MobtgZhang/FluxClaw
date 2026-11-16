@@ -14,8 +14,12 @@ defmodule FluxClawWeb.Router do
     plug :accepts, ["json"]
   end
 
+  get "/health", FluxClawWeb.HealthController, :show
+
   scope "/", FluxClawWeb do
     pipe_through :browser
+
+    get "/artifacts/:session_id/*path", ArtifactController, :show
 
     get "/agents", RedirectController, :to_chat
     get "/agents/:id", RedirectController, :agents_to_chat
