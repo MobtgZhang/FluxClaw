@@ -17,9 +17,9 @@ defmodule FluxClaw.Agents.Orchestrator do
     end
   end
 
-  def send_message(session_id, text) when is_binary(text) do
+  def send_message(session_id, text, metadata \\ %{}) when is_binary(text) do
     with {:ok, pid} <- ensure_worker(session_id) do
-      GenServer.cast(pid, {:user_message, text})
+      GenServer.cast(pid, {:user_message, text, metadata})
       :ok
     end
   end

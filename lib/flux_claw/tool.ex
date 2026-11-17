@@ -36,7 +36,7 @@ defmodule FluxClaw.Tool do
 
   def modules, do: @modules
 
-  def openai_tools do
+  def openai_tools(mode \\ "agent") do
     builtins =
       Enum.map(@modules, fn m ->
         %{
@@ -51,14 +51,23 @@ defmodule FluxClaw.Tool do
 
     names = MapSet.new(Enum.map(@modules, & &1.name()))
 
-    builtins ++
-      Enum.reject(
-        FluxClaw.Plugins.CordisRuntime.list_tools(),
-        &MapSet.member?(names, &1.function.name)
-      )
+    (builtins ++
+       Enum.reject(
+         FluxClaw.Plugins.CordisRuntime.list_tools(),
+         &MapSet.member?(names, &1.function.name)
+       ))
+    |> Enum.filter(&FluxClaw.Agents.ExecutionMode.allowed?(mode, &1.function.name))
   end
 
   def run(name, args, ctx) when is_binary(name) and is_map(args) do
+    if FluxClaw.Agents.ExecutionMode.allowed?(Map.get(ctx, :execution_mode, "agent"), name) do
+      dispatch(name, args, ctx)
+    else
+      {:error, "规划模式不允许执行 #{name}。请用户切换到执行模式后再继续。"}
+    end
+  end
+
+  defp dispatch(name, args, ctx) do
     case Enum.find(@modules, &(&1.name() == name)) do
       nil -> FluxClaw.Plugins.CordisRuntime.call_tool(name, args, ctx)
       module -> module.run(args, ctx)

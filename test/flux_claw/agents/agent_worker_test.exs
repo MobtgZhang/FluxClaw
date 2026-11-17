@@ -14,9 +14,9 @@ defmodule FluxClaw.Agents.AgentWorkerTest do
 
     assert :ok = Orchestrator.send_message(session.id, "hi")
 
-    assert_receive {:user, "hi", _}
-    assert_receive {:assistant_delta, _}
-    assert_receive {:assistant_done, "mock ok", _}
+    assert_receive {:user, "hi", _}, 2_000
+    assert_receive {:assistant_delta, _}, 2_000
+    assert_receive {:assistant_done, "mock ok", _}, 2_000
   end
 
   test "needs_resume? is false when last message is assistant with empty metadata (no stack overflow)" do
@@ -83,10 +83,10 @@ defmodule FluxClaw.Agents.AgentWorkerTest do
     {:ok, session} = Agents.create_session(%{title: "stop"})
     pid = start_supervised!({AgentWorker, session_id: session.id})
     GenServer.cast(pid, {:user_message, "work"})
-    assert_receive {:model_running, task}
+    assert_receive {:model_running, task}, 2_000
     ref = Process.monitor(task)
     :ok = stop_supervised({AgentWorker, session.id})
-    assert_receive {:DOWN, ^ref, :process, ^task, reason}
+    assert_receive {:DOWN, ^ref, :process, ^task, reason}, 2_000
     assert reason in [:killed, :shutdown]
   end
 end

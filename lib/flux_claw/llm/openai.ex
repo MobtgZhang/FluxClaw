@@ -136,15 +136,22 @@ defmodule FluxClaw.LLM.OpenAI do
   defp request_body(messages, tools, opts, model, stream?) do
     cfg = config()
 
+    selected = Keyword.get(opts, :model, model)
+    reasoning? = FluxClaw.LLM.RunSettings.reasoning_model?(selected)
+
     %{
-      model: Keyword.get(opts, :model, model),
+      model: selected,
       messages: messages,
       stream: stream?
     }
     |> maybe_put(:tools, tools)
     |> maybe_put(:tool_choice, Keyword.get(opts, :tool_choice))
-    |> maybe_put(:temperature, Keyword.get(opts, :temperature) || cfg[:temperature])
-    |> maybe_put(:top_p, Keyword.get(opts, :top_p) || cfg[:top_p])
+    |> maybe_put(:reasoning_effort, Keyword.get(opts, :reasoning_effort))
+    |> maybe_put(
+      :temperature,
+      if(!reasoning?, do: Keyword.get(opts, :temperature) || cfg[:temperature])
+    )
+    |> maybe_put(:top_p, if(!reasoning?, do: Keyword.get(opts, :top_p) || cfg[:top_p]))
   end
 
   defp handle_stream_bytes(tid, data, callback) do
