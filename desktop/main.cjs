@@ -16,6 +16,7 @@ else {
   app.whenReady().then(start).catch(fail)
 }
 async function start() {
+  Menu.setApplicationMenu(null)
   const data = app.getPath('userData')
   fs.mkdirSync(data, {recursive:true, mode:0o700})
   const logPath = path.join(data, 'backend.log')
@@ -24,8 +25,15 @@ async function start() {
   const token = crypto.randomBytes(32).toString('hex')
   const dev = process.argv.includes('--dev') && !app.isPackaged
   let origin
-  if (dev) origin = 'http://127.0.0.1:4000'
-  else {
+  if (dev) {
+    const port = await freePort()
+    backend = launch('mix', ['fluxclaw.serve'], {
+      cwd: path.resolve(__dirname, '..'),
+      env: {...process.env, MIX_ENV:'dev', PHX_SERVER:'true',
+        FLUXCLAW_DESKTOP_PORT:String(port), FLUXCLAW_DESKTOP_TOKEN:token}
+    }, log)
+    origin = 'http://127.0.0.1:'+port
+  } else {
     const root = app.isPackaged ? process.resourcesPath : path.join(__dirname,'resources')
     const release = path.join(root,'backend','bin', process.platform === 'win32' ? 'flux_claw.bat' : 'flux_claw')
     const python = path.join(root, 'python', process.platform === 'win32' ? 'python.exe' : 'bin/python3')
@@ -38,10 +46,10 @@ async function start() {
     if (process.platform === 'win32') options.shell = true
     await waitForExit(launch(release,['eval','FluxClaw.Release.migrate()'], options, log))
     backend = launch(release,['start'], options, log)
-    backend.on('error', fail)
-    backend.on('exit', code => { if (!quitting) fail(new Error('Backend exited ('+code+'). See '+logPath)) })
     origin = 'http://127.0.0.1:'+port
   }
+  backend.on('error', fail)
+  backend.on('exit', code => { if (!quitting) fail(new Error('Backend exited ('+code+'). See '+logPath)) })
   const partition = session.fromPartition('persist:fluxclaw')
   partition.setPermissionRequestHandler((wc,permission,callback) =>
     callback(permission === 'clipboard-sanitized-write' && isLocalNavigation(wc.getURL(),origin)))
@@ -51,14 +59,14 @@ async function start() {
     details.requestHeaders['x-fluxclaw-desktop'] = token
     callback({requestHeaders:details.requestHeaders})
   })
-  if (!dev) {
-    const deadline = Date.now()+60000
-    while (!(await health(origin,token))) {
-      if (Date.now() > deadline || backend.exitCode !== null) throw new Error('Backend did not become ready. See '+logPath)
-      await new Promise(resolve => setTimeout(resolve,250))
-    }
+  const deadline = Date.now()+60000
+  while (!(await health(origin,token))) {
+    if (quitting) return
+    if (Date.now() > deadline || backend.exitCode !== null) throw new Error('Backend did not become ready. See '+logPath)
+    await new Promise(resolve => setTimeout(resolve,250))
   }
-  window = new BrowserWindow({width:1360,height:900,minWidth:390,minHeight:600,show:false,backgroundColor:'#FAF9F6', title:'FluxClaw',
+  if (quitting) return
+  window = new BrowserWindow({width:1360,height:900,minWidth:390,minHeight:600,show:false,backgroundColor:'#11191c', title:'FluxClaw',
     webPreferences:{session:partition,contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true,allowRunningInsecureContent:false}})
   window.webContents.setWindowOpenHandler(({url}) => {
     if (isLocalNavigation(url,origin) && new URL(url).pathname.startsWith('/artifacts/')) {
@@ -74,11 +82,6 @@ async function start() {
   })
   window.webContents.on('will-navigate', (event,url) => {if (!isLocalNavigation(url,origin)) {event.preventDefault();openExternal(url)}})
   window.webContents.on('will-attach-webview', event => event.preventDefault())
-  Menu.setApplicationMenu(Menu.buildFromTemplate([
-    ...(process.platform === 'darwin' ? [{role:'appMenu'}] : []),
-    {label:'文件',submenu:[{label:'新建任务',accelerator:'CmdOrCtrl+N',click:()=>window.loadURL(origin)}, {label:'打开数据目录',click:()=>shell.openPath(data)}, {type:'separator'},{role:'quit'}]},
-    {role:'editMenu'}, {label:'视图',submenu:[{role:'reload'},{role:'togglefullscreen'},{role:'resetZoom'},{role:'zoomIn'},{role:'zoomOut'},...(!app.isPackaged?[{role:'toggleDevTools'}]:[])]}
-  ]))
   window.once('ready-to-show', () => window.show())
   window.on('closed', () => {window=null;app.quit()})
   await window.loadURL(origin)
@@ -98,3 +101,5 @@ app.on('before-quit', event => {
   } else quitting=true
 })
 app.on('window-all-closed',()=>app.quit())
+process.on('SIGINT',()=>app.quit())
+process.on('SIGTERM',()=>app.quit())

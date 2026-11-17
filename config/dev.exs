@@ -1,5 +1,19 @@
 import Config
 
+# Keep live reload working on Linux hosts without the optional inotify-tools.
+# Limit polling to reloadable sources/assets instead of walking deps/node_modules.
+inotify =
+  System.get_env("FILESYSTEM_FSINOTIFY_EXECUTABLE_FILE") ||
+    System.find_executable("inotifywait")
+
+if match?({:unix, os} when os in [:linux, :freebsd, :dragonfly, :openbsd], :os.type()) and
+     is_nil(inotify) do
+  config :phoenix_live_reload,
+    backend: :fs_poll,
+    backend_opts: [interval: 1000],
+    dirs: ["lib/flux_claw_web", "priv/static", "priv/gettext"]
+end
+
 # Configure your database (SQLite file under priv/repo)
 config :flux_claw, FluxClaw.Repo,
   adapter: Ecto.Adapters.SQLite3,

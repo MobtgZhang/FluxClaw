@@ -26,6 +26,7 @@ defmodule FluxClawWeb.Endpoint do
     at: "/",
     from: :flux_claw,
     gzip: not code_reloading?,
+    cache_control_for_etags: if(code_reloading?, do: "no-cache", else: "public"),
     only: FluxClawWeb.static_paths(),
     raise_on_missing_only: code_reloading?
 

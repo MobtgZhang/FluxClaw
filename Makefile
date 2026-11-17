@@ -1,10 +1,16 @@
-.PHONY: help setup test serve precommit clean-artifacts clean-sandbox clean-assets
+.PHONY: help setup test assets serve desktop precommit clean-artifacts clean-sandbox clean-assets
+
+ifneq ($(origin PORT), undefined)
+export PORT
+endif
 
 help:
 	@echo "FluxClaw — common targets:"
 	@echo "  make setup          mix deps.get + ecto + assets"
 	@echo "  make test           mix test"
-	@echo "  make serve          mix phx.server"
+	@echo "  make serve          start web app; auto-select a free port from 4000"
+	@echo "  make serve PORT=4100  start web app on a specific port"
+	@echo "  make desktop        start desktop + backend; close window to stop both"
 	@echo "  make precommit      mix precommit"
 	@echo "  make clean-artifacts  remove _build, deps, digested assets, sandbox trees"
 	@echo "  make clean-sandbox  remove local sandbox dirs only"
@@ -16,8 +22,15 @@ setup:
 test:
 	mix test
 
-serve:
-	mix phx.server
+assets:
+	mix assets.build
+
+serve: assets
+	mix fluxclaw.serve
+
+desktop: assets
+	@test -x desktop/node_modules/.bin/electron || npm ci --prefix desktop
+	npm run dev --prefix desktop
 
 precommit:
 	mix precommit
