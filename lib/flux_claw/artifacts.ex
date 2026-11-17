@@ -8,6 +8,8 @@ defmodule FluxClaw.Artifacts do
   def list(session_id) do
     root = root(session_id)
     walk(root, "", 0, []) |> Enum.take(150) |> Enum.sort_by(& &1.path)
+  rescue
+    File.Error -> []
   end
 
   defp walk(_root, _relative, depth, acc) when depth > 8 or length(acc) >= 150, do: acc

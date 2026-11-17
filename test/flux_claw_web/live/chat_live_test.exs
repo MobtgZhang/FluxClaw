@@ -19,20 +19,22 @@ defmodule FluxClawWeb.ChatLiveTest do
     assert has_element?(view, "#workbench-welcome")
   end
 
-  test "details exposes resources, actual integration settings and files", %{conn: conn} do
+  test "details exposes task progress and files, integrations live in settings", %{conn: conn} do
     {:ok, view, _} = live(conn, "/")
     view |> element("#details-toggle") |> render_click()
     assert has_element?(view, "#details-toggle[aria-expanded=true]")
-    assert has_element?(view, "#memory-panel")
-    view |> element("#detail-tab-plugins") |> render_click()
-    assert has_element?(view, "#integration-settings")
-    assert has_element?(view, "#native-integrations")
+    assert has_element?(view, "#task-plan-panel:not([hidden])")
+    refute has_element?(view, "#detail-tab-plugins")
     view |> element("#detail-tab-files") |> render_click()
-    assert has_element?(view, "#artifact-panel")
+    assert has_element?(view, "#artifact-panel:not([hidden])")
     view |> element("#refresh-artifacts") |> render_click()
     assert has_element?(view, "#artifact-files")
     render_click(view, "close_drawers")
     assert has_element?(view, "#details-toggle[aria-expanded=false]")
+    view |> element("#sidebar-settings") |> render_click()
+    view |> element("#settings-tab-integrations") |> render_click()
+    assert has_element?(view, "#integration-settings")
+    assert has_element?(view, "#native-integrations")
   end
 
   test "empty user answers keep the actionable question visible", %{conn: conn} do

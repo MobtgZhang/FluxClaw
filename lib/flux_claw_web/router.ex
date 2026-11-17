@@ -24,7 +24,9 @@ defmodule FluxClawWeb.Router do
     get "/agents", RedirectController, :to_chat
     get "/agents/:id", RedirectController, :agents_to_chat
 
-    live "/", ChatLive, :chat
+    live "/", ChatLive, :home
+    live "/projects", ChatLive, :projects
+    live "/skills", ChatLive, :skills
     live "/chat", ChatLive, :chat
     live "/chat/:id", ChatLive, :chat
     live "/p/:project_id", ChatLive, :chat

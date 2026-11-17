@@ -40,6 +40,9 @@ config :flux_claw, :memory_l0,
     "When self-evolution is enabled, your tool-using episodes are logged under memory for later reuse; generalize patterns, avoid one-off noise."
   ]
 
+# Keep credentials out of settings form event logs.
+config :phoenix, :filter_parameters, ["password", "api_key", "search_key"]
+
 # Configure the endpoint
 config :flux_claw, FluxClawWeb.Endpoint,
   url: [host: "localhost"],

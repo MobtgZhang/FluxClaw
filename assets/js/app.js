@@ -29,11 +29,92 @@ import EasyMDE from "easymde"
 const applyTheme = theme => {
   const resolved = theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light"
   document.documentElement.setAttribute("data-theme", resolved)
+  document.documentElement.setAttribute("data-theme-preference", theme)
 }
-try { applyTheme(localStorage.getItem("phx:theme") || "system") } catch (_) {}
+try { applyTheme(localStorage.getItem("phx:theme") || "dark") } catch (_) {}
 window.addEventListener("storage", event => { if (event.key === "phx:theme") applyTheme(event.newValue || "system") })
 
+window.addEventListener("fluxclaw:set-theme", event => {
+  const theme = event.detail.theme
+  if (!["dark", "light", "system"].includes(theme)) return
+  try { localStorage.setItem("phx:theme", theme) } catch (_) {}
+  applyTheme(theme)
+})
+
+const positionModelPicker = () => {
+  const panel = document.getElementById("composer-model-panel")
+  const button = document.getElementById("composer-model")
+  if (!panel || !button) return
+  const rect = button.getBoundingClientRect()
+  const viewport = window.visualViewport
+  const height = viewport?.height || window.innerHeight
+  const width = viewport?.width || window.innerWidth
+  const available = rect.top - 20
+  const panelWidth = Math.min(430, width - 28)
+  panel.style.left = Math.max(14, Math.min(rect.left, width - panelWidth - 14)) + "px"
+  panel.style.width = panelWidth + "px"
+  panel.style.bottom = (available < 280 ? 12 : height - rect.top + 8) + "px"
+  panel.style.maxHeight = Math.min(620, available < 280 ? height - 24 : available) + "px"
+}
+
 const Hooks = {
+  WorkbenchShortcuts: {
+    mounted() {
+      this.onKeyboard = event => {
+        const palette = document.getElementById("command-palette")
+        const settings = document.getElementById("settings-center")
+        const modelPicker = document.getElementById("composer-model-panel")
+        if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+          event.preventDefault()
+          this.paletteTrigger = document.activeElement
+          this.pushEvent("toggle_palette")
+          return
+        }
+        if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "n") {
+          event.preventDefault()
+          if (!palette && !settings) this.pushEvent("new_chat")
+          return
+        }
+        if (event.key === "Escape") {
+          const target = modelPicker ? document.getElementById("composer-model") : palette ? this.paletteTrigger : settings ? document.getElementById("sidebar-settings") : null
+          requestAnimationFrame(() => target?.focus())
+          return
+        }
+        if (palette && ["ArrowDown", "ArrowUp", "Enter"].includes(event.key)) {
+          const results = [...palette.querySelectorAll(".cw-command-result")]
+          if (!results.length) return
+          const index = results.indexOf(document.activeElement)
+          if (event.key === "Enter" && index >= 0) return
+          event.preventDefault()
+          if (event.key === "Enter") results[0].click()
+          else results[event.key === "ArrowDown" ? (index + 1) % results.length : (index <= 0 ? results.length - 1 : index - 1)].focus()
+          return
+        }
+        const modal = palette || settings || modelPicker
+        if (modal && event.key === "Tab") {
+          const items = [...modal.querySelectorAll("button, a, input, select, textarea, summary")].filter(el => !el.disabled && el.getClientRects().length)
+          const first = items[0], last = items[items.length - 1]
+          if (event.shiftKey && (document.activeElement === first || !modal.contains(document.activeElement))) { event.preventDefault(); last?.focus() }
+          if (!event.shiftKey && (document.activeElement === last || !modal.contains(document.activeElement))) { event.preventDefault(); first?.focus() }
+        }
+      }
+      window.addEventListener("keydown", this.onKeyboard)
+      this.settingsObserver = new MutationObserver(() => {
+        const modal = document.getElementById("settings-center")
+        if (modal && !this.settingsWasOpen) modal.querySelector("#close-settings")?.focus()
+        this.settingsWasOpen = !!modal
+        const picker = document.getElementById("composer-model-panel")
+        positionModelPicker()
+        if (picker && !this.pickerWasOpen) picker.querySelector("#composer-model-query")?.focus()
+        this.pickerWasOpen = !!picker
+      })
+      this.settingsObserver.observe(this.el, {childList: true, subtree: true})
+    },
+    destroyed() {
+      window.removeEventListener("keydown", this.onKeyboard)
+      this.settingsObserver?.disconnect()
+    }
+  },
   SidebarContextMenu: {
     mounted() {
       this.el.addEventListener("click", e => {
@@ -115,8 +196,8 @@ const Hooks = {
       this.el.addEventListener("click", () => {
         const html = document.documentElement
         const next = html.getAttribute("data-theme") === "dark" ? "light" : "dark"
-        html.setAttribute("data-theme", next)
-        localStorage.setItem("phx:theme", next)
+        applyTheme(next)
+        try { localStorage.setItem("phx:theme", next) } catch (_) {}
         sync()
       })
     }
@@ -192,7 +273,7 @@ const Hooks = {
       }
     },
     scrollBottom() {
-      this.el.scrollTop = this.el.scrollHeight
+      this.el.scrollTop = this.el.querySelector("#workbench-welcome") ? 0 : this.el.scrollHeight
     }
   },
   ChatComposer: {
@@ -200,19 +281,62 @@ const Hooks = {
       this.key = "fluxclaw:draft:" + this.el.dataset.draftKey
       try { this.el.value = sessionStorage.getItem(this.key) || "" } catch (_) {}
       this.resize()
-      this.onInput = () => { this.resize(); try { sessionStorage.setItem(this.key, this.el.value) } catch (_) {} }
+      this.form = this.el.closest("form")
+      this.onInput = () => { this.resize(); this.syncSend(); try { sessionStorage.setItem(this.key, this.el.value) } catch (_) {} }
       this.onKey = event => this.onKeydown(event)
       this.handleEvent("composer-clear", () => { this.el.value = ""; this.onInput() })
-      this.handleEvent("composer-attach", ({paths}) => { this.el.value += "\n\n附件路径：\n" + paths.join("\n"); this.onInput(); this.el.focus() })
       this.handleEvent("composer-fill", ({text}) => { this.el.value = text || ""; this.onInput(); this.el.focus() })
       this.el.addEventListener("input", this.onInput)
       this.el.addEventListener("keydown", this.onKey)
+      this.onPaste = event => {
+        const files = [...(event.clipboardData?.files || [])]
+        if (!files.length || this.form.dataset.locked === "true") return
+        event.preventDefault()
+        this.upload("attachments", files)
+      }
+      this.el.addEventListener("paste", this.onPaste)
+      this.onDragOver = event => {
+        if (event.dataTransfer?.types.includes("Files") && this.form.dataset.locked !== "true") {
+          event.preventDefault()
+          this.form.classList.add("is-dragging")
+        }
+      }
+      this.onDragLeave = event => { if (!this.form.contains(event.relatedTarget)) this.form.classList.remove("is-dragging") }
+      this.onDrop = () => this.form.classList.remove("is-dragging")
+      this.form.addEventListener("dragover", this.onDragOver)
+      this.form.addEventListener("dragleave", this.onDragLeave)
+      this.form.addEventListener("drop", this.onDrop)
+      this.onLayout = () => this.positionPicker()
+      this.layoutObserver = new ResizeObserver(this.onLayout)
+      this.layoutObserver.observe(this.form)
+      window.addEventListener("resize", this.onLayout)
+      window.visualViewport?.addEventListener("resize", this.onLayout)
+      this.positionPicker()
+      this.sendObserver = new MutationObserver(() => this.syncSend())
+      this.sendObserver.observe(this.form, {attributes: true, childList: true, subtree: true, attributeFilter: ["disabled", "data-locked", "data-upload-blocked", "data-attachment-count"]})
+      this.syncSend()
     },
-    updated() { this.resize() },
+    updated() { this.resize(); this.syncSend() },
+    syncSend() {
+      const button = this.form?.querySelector("#chat-send-btn")
+      if (button) {
+        const disabled = this.form.dataset.locked === "true" || this.form.dataset.uploadBlocked === "true" || (!this.el.value.trim() && Number(this.form.dataset.attachmentCount) === 0)
+        if (button.disabled !== disabled) button.disabled = disabled
+      }
+    },
     destroyed() {
       this.el.removeEventListener("input", this.onInput)
       this.el.removeEventListener("keydown", this.onKey)
+      this.el.removeEventListener("paste", this.onPaste)
+      this.form?.removeEventListener("dragover", this.onDragOver)
+      this.form?.removeEventListener("dragleave", this.onDragLeave)
+      this.form?.removeEventListener("drop", this.onDrop)
+      this.sendObserver?.disconnect()
+      this.layoutObserver?.disconnect()
+      window.removeEventListener("resize", this.onLayout)
+      window.visualViewport?.removeEventListener("resize", this.onLayout)
     },
+    positionPicker() { positionModelPicker() },
     resize() {
       this.el.style.height = "auto"
       this.el.style.height = Math.min(this.el.scrollHeight, 220) + "px"
@@ -221,7 +345,7 @@ const Hooks = {
       if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return
       e.preventDefault()
       if (this.el.closest("form")?.querySelector("#chat-stop-btn, button[type=submit]:disabled")) return
-      if (this.el.value.trim()) this.el.closest("form")?.requestSubmit()
+      this.el.closest("form")?.requestSubmit()
     }
   }
 
@@ -294,6 +418,7 @@ window.addEventListener("click", event => {
   if (event.target.closest("[phx-click=toggle_sidebar], [phx-click=toggle_right], [phx-click=set_right_tab]")) drawerTrigger = event.target.closest("button")
 })
 window.addEventListener("keydown", event => {
+  if (document.getElementById("command-palette") || document.getElementById("settings-center")) return
   if (event.key === "Escape" && drawerTrigger) { requestAnimationFrame(() => drawerTrigger?.focus()); return }
   if (event.key !== "Tab") return
   const drawer = [document.getElementById("sidebar-right"), document.getElementById("sidebar-root")].find(element => drawerVisible(element) && getComputedStyle(element).position === "fixed")
