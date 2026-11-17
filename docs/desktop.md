@@ -6,20 +6,23 @@ Linux 构建产物位于 `desktop/dist/`：AppImage 可赋予执行权限后启�
 
 桌面后端仅绑定随机的 `127.0.0.1` 端口，每次启动生成会话凭证。Electron 为页面、资源与 WebSocket 请求添加凭证，普通本地客户端请求返回 403。renderer 启用 contextIsolation、sandbox，关闭 Node 集成和 webview；仅允许应用来源写入普通剪贴板，拒绝其他权限。外链仅允许 HTTP(S) 并交给系统浏览器，文件预览留在带凭证的应用窗口。
 
-应用数据使用 Electron `userData` 目录：Linux 通常 `~/.config/FluxClaw`，macOS 通常 `~/Library/Application Support/FluxClaw`，Windows 通常 `%APPDATA%/FluxClaw`。开发版名称可能为 `fluxclaw-desktop`。菜单“文件 → 打开数据目录”可定位实际路径。数据库 `fluxclaw.db`、模型配置 `config.json`、`workspaces/`、`cache/` 和 `backend.log` 均保存在这里。密钥为本地配置文件存储，不是系统钥匙串。
+应用数据使用 Electron `userData` 目录：Linux 通常 `~/.config/FluxClaw`，macOS 通常 `~/Library/Application Support/FluxClaw`，Windows 通常 `%APPDATA%/FluxClaw`。开发版名称可能为 `fluxclaw-desktop`。可通过 `FLUXCLAW_DESKTOP_DATA` 指定目录。数据库 `fluxclaw.db`、模型配置 `config.json`、`workspaces/`、`cache/` 和 `backend.log` 均保存在这里。密钥为本地配置文件存储，不是系统钥匙串。
 
 `FLUXCLAW_DESKTOP_DATA=/absolute/path` 可显式指定独立数据目录。退出应用会停止后端。启动失败时查看 `backend.log`，应用不显示模型密钥。
 
 ## 开发
 
 ```bash
-mix phx.server
-# 另一个终端；开发窗口连接 127.0.0.1:4000
-npm ci --prefix desktop
-npm run dev --prefix desktop
+make desktop
 ```
 
-开发模式使用现有 Phoenix 服务。生产模式始终启动随包 release，不依赖系统 mix，也不连接现有 4000 端口。
+首次使用先运行 `make setup`。`make desktop` 自动安装缺失的 Electron 依赖、构建前端，再打开桌面窗口。开发窗口会启动并管理自己的 Phoenix 后端，使用随机的本机端口和会话凭证；无需提前运行 `mix phx.server`。关闭主窗口、选择退出或在终端按 Ctrl+C，都会停止该后端。其他独立启动的网页服务不受影响。
+
+网页版运行 `make serve`，两端共用前端、后端启动入口、数据库迁移以及开发数据库和模型配置。网页版默认使用 4000 端口；占用时自动从 4001–4019 中寻找可用端口，按终端打印的地址访问。也可用 `make serve PORT=4100` 严格指定端口，按 Ctrl+C 停止服务。桌面版始终使用独立随机端口，可与网页版同时运行。
+
+Linux 未安装 `inotify-tools` 时，两端自动改用轮询监听页面和资源变更，仍支持自动刷新，无需安装额外系统依赖。
+
+依赖和前端已就绪时，也可以直接运行 `npm run dev --prefix desktop`。生产模式始终启动随包 release，不依赖系统 mix。
 
 ## 原生构建
 
